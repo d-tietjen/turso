@@ -4,6 +4,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Instant;
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
@@ -19,6 +20,8 @@ use turso_sync_engine::server_proto::{
     StmtResult, StreamRequest, StreamResponse, StreamResult, Value,
 };
 
+use crate::sync_server_metrics::{SyncEndpoint, SyncServerMetrics};
+
 const WAL_FRAME_HEADER_SIZE: usize = 24;
 const PAGE_SIZE: usize = 4096;
 
@@ -26,6 +29,7 @@ pub struct TursoSyncServer {
     address: String,
     conn: Arc<Mutex<Arc<Connection>>>,
     interrupt_count: Arc<AtomicUsize>,
+    metrics: Arc<SyncServerMetrics>,
 }
 
 impl TursoSyncServer {
@@ -35,6 +39,7 @@ impl TursoSyncServer {
             address,
             conn: Arc::new(Mutex::new(conn)),
             interrupt_count,
+            metrics: Arc::new(SyncServerMetrics::new()),
         }
     }
 
@@ -118,12 +123,26 @@ impl TursoSyncServer {
 
         let (method, path, body) = parse_http_request(&request_data)?;
         info!("Request: {} {}", method, path);
+        self.metrics.record_bytes_received(request_data.len());
+
+        let endpoint = match (method.as_str(), path.as_str()) {
+            ("POST", "/v2/pipeline") => SyncEndpoint::Pipeline,
+            ("POST", "/pull-updates") => SyncEndpoint::PullUpdates,
+            ("GET", "/metrics") => SyncEndpoint::Metrics,
+            _ => SyncEndpoint::Unknown,
+        };
+        let request_start = Instant::now();
 
         let response = match (method.as_str(), path.as_str()) {
             ("OPTIONS", _) => Ok(HttpResponse {
                 status: 204,
                 content_type: "text/plain".to_string(),
                 body: Vec::new(),
+            }),
+            ("GET", "/metrics") => Ok(HttpResponse {
+                status: 200,
+                content_type: "text/plain; version=0.0.4".to_string(),
+                body: self.metrics.render_prometheus().into_bytes(),
             }),
             ("POST", "/v2/pipeline") => {
                 debug!("Handling /v2/pipeline request");
@@ -155,7 +174,14 @@ impl TursoSyncServer {
             }
         };
 
+        self.metrics.record_request(
+            endpoint,
+            http_response.status,
+            request_start.elapsed().as_micros() as u64,
+        );
+
         let response_bytes = format_http_response(&http_response);
+        self.metrics.record_bytes_sent(response_bytes.len());
         stream.write_all(&response_bytes)?;
         stream.flush()?;
 

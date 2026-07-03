@@ -9,6 +9,7 @@ mod mcp_server;
 mod opcodes_dictionary;
 mod read_state_machine;
 mod sync_server;
+mod sync_server_metrics;
 
 #[cfg(feature = "mvcc_repl")]
 mod mvcc_repl;
