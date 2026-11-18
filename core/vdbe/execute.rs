@@ -506,6 +506,10 @@ pub fn op_checkpoint(
         state.registers[dest + 2].set_int(-1);
     }
 
+    if program.connection.db.is_encrypted_overlap_reader() {
+        return Err(LimboError::ReadOnly);
+    }
+
     load_insn!(
         Checkpoint {
             database,

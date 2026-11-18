@@ -289,6 +289,7 @@ impl TursoDatabaseConfig {
 
 pub struct TursoDatabase {
     config: TursoDatabaseConfig,
+    encrypted_overlap_reader: bool,
     open_state: Mutex<TursoDatabaseOpenState>,
     db: Arc<Mutex<Option<Arc<Database>>>>,
     io: Mutex<Option<Arc<dyn turso_core::IO>>>,
@@ -551,8 +552,27 @@ impl TursoDatabase {
     /// create database holder struct but do not initialize it yet
     /// this can be useful for some environments, where IO operations must be executed in certain fashion (and open do IO under the hood)
     pub fn new(config: TursoDatabaseConfig) -> Arc<Self> {
+        Self::with_overlap_role(config, false)
+    }
+
+    /// Create a holder that opens only the encrypted overlap reader role.
+    /// The reader uses a built-in local VFS and must supply encryption credentials.
+    pub fn new_encrypted_overlap_reader(
+        config: TursoDatabaseConfig,
+    ) -> Result<Arc<Self>, TursoError> {
+        if config.encryption.is_none() || config.db_file.is_some() || config.io.is_some() {
+            return Err(TursoError::Misuse(
+                "encrypted overlap requires credentials and a built-in file VFS".to_string(),
+            ));
+        }
+        Ok(Self::with_overlap_role(config, true))
+    }
+
+    /// Preserve the selected open role throughout asynchronous initialization.
+    fn with_overlap_role(config: TursoDatabaseConfig, encrypted_overlap_reader: bool) -> Arc<Self> {
         Arc::new(Self {
             config,
+            encrypted_overlap_reader,
             db: Arc::new(Mutex::new(None)),
             open_state: Mutex::new(TursoDatabaseOpenState::new()),
             io: Mutex::new(None),
@@ -665,6 +685,10 @@ impl TursoDatabase {
                         }
                     }
 
+                    if self.encrypted_overlap_reader {
+                        opts = opts.with_encrypted_overlap_reader();
+                    }
+
                     if self.config.encryption.is_some() && !opts.enable_encryption {
                         return Err(TursoError::Error(
                             "encryption is experimental and must be explicitly enabled through experimental features list".to_string(),
@@ -675,7 +699,9 @@ impl TursoDatabase {
                     if opts.enable_multiprocess_wal {
                         open_flags |= OpenFlags::NoLock;
                     }
-                    let db_file = if let Some(db_file) = &self.config.db_file {
+                    let db_file = if self.encrypted_overlap_reader {
+                        Database::open_encrypted_overlap_reader_file(&io, &self.config.path)?
+                    } else if let Some(db_file) = &self.config.db_file {
                         db_file.clone()
                     } else {
                         let file = io.open_file(&self.config.path, open_flags, true)?;
@@ -700,13 +726,18 @@ impl TursoDatabase {
                         .expect("db_file must be initialized in Init phase")
                         .clone();
                     let opts = state.opts.expect("opts must be initialized in Init phase");
+                    let open_flags = if self.encrypted_overlap_reader {
+                        OpenFlags::ReadOnly
+                    } else {
+                        OpenFlags::default()
+                    };
 
                     match Database::open_with_flags_async(
                         &mut state.open_db_state,
                         io.clone(),
                         &self.config.path,
                         db_file,
-                        OpenFlags::default(),
+                        open_flags,
                         opts,
                         self.config.encryption.clone(),
                         None,

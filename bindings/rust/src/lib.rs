@@ -280,19 +280,37 @@ impl Builder {
     }
 
     /// Build the database.
-    #[allow(unused_variables, clippy::arc_with_non_send_sync)]
     pub async fn build(self) -> Result<Database> {
+        self.build_database(false).await
+    }
+
+    /// Attach as a read-only overlap reader in a separate process on 64-bit Linux.
+    /// Supply the AES-256-GCM credentials with [`Self::with_encryption`]. An
+    /// existing initialized WAL database and its compatible shared coordinator are
+    /// required. The reader cannot write, create a database, or attach another
+    /// database. The application retains mutation custody in the existing writer.
+    pub async fn build_encrypted_overlap_reader(self) -> Result<Database> {
+        self.build_database(true).await
+    }
+
+    /// Build the selected database role and drive its asynchronous file open.
+    #[allow(unused_variables, clippy::arc_with_non_send_sync)]
+    async fn build_database(self, encrypted_overlap_reader: bool) -> Result<Database> {
         let features = self.build_features_string();
-        let db =
-            turso_sdk_kit::rsapi::TursoDatabase::new(turso_sdk_kit::rsapi::TursoDatabaseConfig {
-                path: self.path,
-                experimental_features: features,
-                async_io: true,
-                encryption: self.encryption_opts,
-                vfs: self.vfs,
-                io: self.io,
-                db_file: None,
-            });
+        let config = turso_sdk_kit::rsapi::TursoDatabaseConfig {
+            path: self.path,
+            experimental_features: features,
+            async_io: true,
+            encryption: self.encryption_opts,
+            vfs: self.vfs,
+            io: self.io,
+            db_file: None,
+        };
+        let db = if encrypted_overlap_reader {
+            turso_sdk_kit::rsapi::TursoDatabase::new_encrypted_overlap_reader(config)?
+        } else {
+            turso_sdk_kit::rsapi::TursoDatabase::new(config)
+        };
         while let Some(io_c) = db.open()?.io() {
             // At this point IO must already be created
             let io = db

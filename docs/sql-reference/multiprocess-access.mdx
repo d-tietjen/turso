@@ -147,6 +147,29 @@ To switch modes, close all existing connections to the database, then reopen wit
 
 Read-only opens are advisory: if `multiprocess_wal` is requested on a read-only open and no `.tshm` file exists, Turso falls back to the legacy read-only WAL path rather than failing. This lets read-only tooling work against a database that was closed cleanly by a single-process writer.
 
+## Encrypted Overlap in the Rust SDK
+
+`Builder::build_encrypted_overlap_reader` opens an initialized AES-256-GCM WAL
+database in a separate read-only process on 64-bit Linux. The existing writer
+must use the multiprocess WAL option and complete a checkpoint before overlap
+so the reader can authenticate the stored database header with its key.
+
+```rust
+let reader = turso::Builder::new_local(path)
+    .with_encryption(encryption_options)
+    .build_encrypted_overlap_reader()
+    .await?;
+```
+
+The reader uses the existing database, WAL, and `.tshm` coordinator. It can
+pin a committed snapshot while the writer continues. A truncating checkpoint
+may report busy until the reader ends its transaction. A concurrent checkpoint
+can require retrying the reader open. The reader requires a live shared peer
+with a compatible coordinator and usable shared frame index. It prevents SQL
+writes, checkpoints, vacuum and attachment of other databases. The application
+retains sole mutation custody in the existing writer and coordinates any future
+transfer.
+
 ## Limitations
 
 - The `.tshm` file format is versioned and may change in future releases. A format bump invalidates existing `.tshm` files — Turso recreates them on open; it does not attempt cross-version migration.

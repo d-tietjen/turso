@@ -1293,6 +1293,8 @@ struct ShmWalCoordination {
     authority: Arc<MappedSharedWalCoordination>,
     /// This connection's currently held reader slot, if any.
     active_reader: Mutex<Option<SharedReaderSlot>>,
+    /// Overlap readers register database-file snapshots and never seed the authority.
+    overlap_reader: bool,
     /// Copied from `authority.owner_record()` at construction — all connections
     /// in the same process share the same owner identity.
     owner: SharedOwnerRecord,
@@ -1347,6 +1349,15 @@ impl ShmWalCoordination {
         shared: Arc<RwLock<WalFileShared>>,
         authority: Arc<MappedSharedWalCoordination>,
     ) -> Self {
+        Self::with_overlap_role(shared, authority, false)
+    }
+
+    /// Join an existing authority without publishing repairs from the local open.
+    fn with_overlap_role(
+        shared: Arc<RwLock<WalFileShared>>,
+        authority: Arc<MappedSharedWalCoordination>,
+        overlap_reader: bool,
+    ) -> Self {
         let fallback = InProcessWalCoordination::new(shared.clone());
         let coordination = Self {
             shared,
@@ -1354,9 +1365,40 @@ impl ShmWalCoordination {
             owner: authority.owner_record(),
             authority,
             active_reader: Mutex::new(None),
+            overlap_reader,
         };
-        coordination.seed_or_sync_authority();
+        if overlap_reader {
+            coordination.sync_local_from_authority(coordination.authority.snapshot());
+        } else {
+            coordination.seed_or_sync_authority();
+        }
         coordination
+    }
+
+    /// Publish a reader slot and discard it if the WAL generation changed during admission.
+    fn pin_shared_snapshot(&self, snapshot: WalSnapshot) -> bool {
+        let Some(reader) = self
+            .authority
+            .register_reader_for_snapshot(self.owner, snapshot.max_frame)
+        else {
+            return false;
+        };
+        // A restart can pass its reader census before our slot is published
+        // and still have the old generation visible. Check custody after
+        // publishing the slot so a later restart must observe it.
+        let restart_in_progress = self.overlap_reader
+            && (self.authority.checkpoint_lock_active()
+                || (snapshot.max_frame != 0
+                    && snapshot.max_frame == snapshot.nbackfills
+                    && self.authority.writer_or_checkpoint_lock_active()));
+        if restart_in_progress || self.load_snapshot() != snapshot {
+            self.authority.unregister_reader_for_snapshot(reader);
+            return false;
+        }
+        let mut active_reader = self.active_reader.lock();
+        turso_assert!(active_reader.is_none(), "shared reader registration leaked");
+        *active_reader = Some(reader);
+        true
     }
 
     fn authority_is_uninitialized(snapshot: SharedWalCoordinationHeader) -> bool {
@@ -1908,7 +1950,14 @@ impl WalCoordination for ShmWalCoordination {
             if !read_locks[0].read() {
                 return None;
             }
-            if self.load_snapshot() != snapshot {
+            // A process-local database read mark cannot stop a different
+            // writer's checkpoint. Pin even frame zero for an overlap reader.
+            let pinned = if self.overlap_reader {
+                self.pin_shared_snapshot(snapshot)
+            } else {
+                self.load_snapshot() == snapshot
+            };
+            if !pinned {
                 read_locks[0].unlock();
                 return None;
             }
@@ -1950,18 +1999,10 @@ impl WalCoordination for ShmWalCoordination {
 
         let read_mark_index =
             NonZeroUsize::new(best_idx as usize).expect("best_idx checked to be positive");
-        let reader = self
-            .authority
-            .register_reader_for_snapshot(self.owner, snapshot.max_frame)?;
-        if self.load_snapshot() != snapshot {
-            self.authority.unregister_reader_for_snapshot(reader);
+        if !self.pin_shared_snapshot(snapshot) {
             read_locks[best_idx as usize].unlock();
             return None;
         }
-
-        let mut active_reader = self.active_reader.lock();
-        turso_assert!(active_reader.is_none(), "shared reader registration leaked");
-        *active_reader = Some(reader);
         Some(ReadGuardKind::ReadMark(read_mark_index))
     }
 
@@ -4314,9 +4355,15 @@ impl WalFile {
         authority: Arc<MappedSharedWalCoordination>,
         _last_checksum_and_max_frame: ((u32, u32), u64),
         buffer_pool: Arc<BufferPool>,
+        overlap_reader: bool,
     ) -> Self {
-        let coordination: Arc<dyn WalCoordination> =
-            Arc::new(ShmWalCoordination::new(shared, authority));
+        let coordination: Arc<dyn WalCoordination> = if overlap_reader {
+            Arc::new(ShmWalCoordination::with_overlap_role(
+                shared, authority, true,
+            ))
+        } else {
+            Arc::new(ShmWalCoordination::new(shared, authority))
+        };
         let snapshot = coordination.load_snapshot();
         Self::new_with_coordination(
             io,
@@ -7153,6 +7200,7 @@ pub mod test {
             reopened_authority.clone(),
             ((0, 0), 0),
             buffer_pool,
+            false,
         );
 
         wal.begin_read_tx().unwrap();
@@ -7259,8 +7307,14 @@ pub mod test {
 
         let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
         buffer_pool.finalize_with_page_size(4096).unwrap();
-        let wal =
-            WalFile::new_with_shared_coordination(io, shared, authority, ((0, 0), 0), buffer_pool);
+        let wal = WalFile::new_with_shared_coordination(
+            io,
+            shared,
+            authority,
+            ((0, 0), 0),
+            buffer_pool,
+            false,
+        );
 
         assert_eq!(wal.get_max_frame(), 1);
         assert_eq!(wal.get_last_checksum(), (31, 37));

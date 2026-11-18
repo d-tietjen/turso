@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.2 -- Unreleased
+
+### Added
+
+* Add a bounded read-only overlap role for existing AES-256-GCM shared WAL
+  databases on 64-bit Linux (EDEN-3906).
+
+### Fixed
+
+* Validate encrypted database headers when recording durable WAL backfill
+  progress (EDEN-3906).
+
 ## 0.6.1 -- 2026-05-22
 
 ### Fixed

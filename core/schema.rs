@@ -546,6 +546,8 @@ struct MakeFromBtreeAccumulators {
 pub enum MakeFromBtreePhase {
     #[default]
     Init,
+    /// Read the schema cookie from the scan's pinned WAL snapshot.
+    ReadingSchemaCookie,
     Rewinding,
     FetchingRecord,
     Advancing,
@@ -558,6 +560,8 @@ pub struct MakeFromBtreeState {
     cursor: Option<BTreeCursor>,
     accumulators: Option<MakeFromBtreeAccumulators>,
     read_tx_active: bool,
+    /// Capture the schema identity with the same snapshot as its b-tree rows.
+    read_schema_cookie: bool,
 }
 
 impl Default for MakeFromBtreeState {
@@ -573,7 +577,13 @@ impl MakeFromBtreeState {
             cursor: None,
             accumulators: None,
             read_tx_active: false,
+            read_schema_cookie: false,
         }
+    }
+
+    /// Load the schema cookie after opening the scan's read transaction.
+    pub(crate) fn read_schema_cookie_with_snapshot(&mut self) {
+        self.read_schema_cookie = true;
     }
 
     /// Cleanup on error - ensures end_read_tx is called
@@ -1343,6 +1353,16 @@ impl Schema {
                         materialized_view_info: HashMap::default(),
                     });
 
+                    state.phase = if state.read_schema_cookie {
+                        MakeFromBtreePhase::ReadingSchemaCookie
+                    } else {
+                        MakeFromBtreePhase::Rewinding
+                    };
+                }
+
+                MakeFromBtreePhase::ReadingSchemaCookie => {
+                    self.schema_version =
+                        return_if_io!(pager.with_header(|header| header.schema_cookie.get()));
                     state.phase = MakeFromBtreePhase::Rewinding;
                 }
 

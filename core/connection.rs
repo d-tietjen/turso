@@ -1614,6 +1614,9 @@ impl Connection {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
+        if self.db.is_encrypted_overlap_reader() {
+            return Err(LimboError::ReadOnly);
+        }
         if let Some(mv_store) = self.mv_store().as_ref() {
             let pager = self.pager.load().clone();
             let io = pager.io.clone();
