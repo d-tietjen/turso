@@ -514,6 +514,59 @@ pub struct EncryptionContext {
     page_size: usize,
 }
 
+/// Validate the stored encrypted-header format without decrypting page data.
+///
+/// WAL durability proofs accept any supported cipher with `None`; page decryption
+/// supplies its configured cipher and still authenticates the complete page via AEAD.
+/// The bytes are only inspected, so callers can checksum the original stored header.
+pub(crate) fn validate_turso_header(
+    header: &[u8],
+    expected_cipher: Option<CipherMode>,
+) -> Result<()> {
+    if header.len() < TURSO_HEADER_SIZE {
+        return Err(LimboError::InternalError(
+            "Header too short for encrypted Turso db".into(),
+        ));
+    }
+
+    if &header[..TURSO_HEADER_PREFIX.len()] != TURSO_HEADER_PREFIX {
+        return Err(LimboError::InternalError(
+            "Invalid Turso header: prefix mismatch".into(),
+        ));
+    }
+
+    let version = header[VERSION_OFFSET];
+    if version != TURSO_VERSION {
+        return Err(LimboError::InternalError(format!(
+            "Unsupported Turso header version: expected {TURSO_VERSION}, got {version}"
+        )));
+    }
+
+    let cipher_id = header[CIPHER_OFFSET];
+    let header_cipher = CipherMode::from_cipher_id(cipher_id)?;
+    if let Some(expected_cipher) = expected_cipher {
+        if header_cipher != expected_cipher {
+            return Err(LimboError::InternalError(format!(
+                "Cipher mode mismatch: expected {:?} (ID {}), got {:?} (ID {})",
+                expected_cipher,
+                expected_cipher.cipher_id(),
+                header_cipher,
+                cipher_id
+            )));
+        }
+    }
+
+    if header[CIPHER_OFFSET + 1..TURSO_HEADER_SIZE]
+        .iter()
+        .any(|&b| b != 0)
+    {
+        return Err(LimboError::InternalError(
+            "Invalid Turso header: unused bytes must be zero".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl EncryptionContext {
     pub fn new(cipher_mode: CipherMode, key: &EncryptionKey, page_size: usize) -> Result<Self> {
         let required_size = cipher_mode.required_key_size();
@@ -600,48 +653,9 @@ impl EncryptionContext {
         header
     }
 
-    /// Validates and extracts cipher mode from Turso header
+    /// Validate the encrypted header against this connection's configured cipher.
     fn validate_turso_header(&self, header: &[u8]) -> Result<()> {
-        if header.len() < TURSO_HEADER_SIZE {
-            return Err(LimboError::InternalError(
-                "Header too short for encrypted Turso db".into(),
-            ));
-        }
-
-        if &header[..TURSO_HEADER_PREFIX.len()] != TURSO_HEADER_PREFIX {
-            return Err(LimboError::InternalError(
-                "Invalid Turso header: prefix mismatch".into(),
-            ));
-        }
-
-        let version = header[VERSION_OFFSET];
-        if version != TURSO_VERSION {
-            return Err(LimboError::InternalError(format!(
-                "Unsupported Turso header version: expected {TURSO_VERSION}, got {version}"
-            )));
-        }
-
-        let cipher_id = header[CIPHER_OFFSET];
-        let header_cipher = CipherMode::from_cipher_id(cipher_id)?;
-        if header_cipher != self.cipher_mode {
-            return Err(LimboError::InternalError(format!(
-                "Cipher mode mismatch: expected {:?} (ID {}), got {:?} (ID {})",
-                self.cipher_mode,
-                self.cipher_mode.cipher_id(),
-                header_cipher,
-                cipher_id
-            )));
-        }
-
-        if header[CIPHER_OFFSET + 1..TURSO_HEADER_SIZE]
-            .iter()
-            .any(|&b| b != 0)
-        {
-            return Err(LimboError::InternalError(
-                "Invalid Turso header: unused bytes must be zero".into(),
-            ));
-        }
-        Ok(())
+        validate_turso_header(header, Some(self.cipher_mode))
     }
 
     #[cfg(feature = "encryption")]

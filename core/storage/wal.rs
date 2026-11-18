@@ -20,6 +20,7 @@ use std::fmt::{Debug, Formatter};
 use std::{fmt, sync::Arc};
 
 use super::buffer_pool::BufferPool;
+use super::encryption::validate_turso_header;
 use super::pager::{PageRef, Pager};
 use super::sqlite3_ondisk::{
     self, checksum_wal, DatabaseHeader, WalHeader, WAL_MAGIC_BE, WAL_MAGIC_LE,
@@ -5064,6 +5065,11 @@ fn wal_header_matches_authority_snapshot(
         && wal_header.salt_2 == snapshot.salt_2
 }
 
+/// Read the page count and checksum the exact stored 100-byte database header.
+///
+/// Both SQLite and structurally valid encrypted Turso headers can identify a
+/// durable backfill. This does not authenticate encrypted data or replace the
+/// cipher-context and AEAD checks performed when reading page 1.
 pub(crate) fn database_identity_from_header_bytes(header_bytes: &[u8]) -> Result<(u32, u32)> {
     if header_bytes.len() < DatabaseHeader::SIZE {
         return Err(LimboError::Corrupt(format!(
@@ -5072,10 +5078,17 @@ pub(crate) fn database_identity_from_header_bytes(header_bytes: &[u8]) -> Result
             header_bytes.len()
         )));
     }
-    if header_bytes[0..16] != *b"SQLite format 3\0" {
+    if header_bytes[0..16] != *b"SQLite format 3\0"
+        && validate_turso_header(header_bytes, None).is_err()
+    {
         return Err(LimboError::Corrupt("database header magic mismatch".into()));
     }
-    let db_size_pages = u32::from_be_bytes(header_bytes[28..32].try_into().unwrap());
+    let db_size_pages = u32::from_be_bytes([
+        header_bytes[28],
+        header_bytes[29],
+        header_bytes[30],
+        header_bytes[31],
+    ]);
     let header_crc32c = crc32c::crc32c(&header_bytes[..DatabaseHeader::SIZE]);
     Ok((db_size_pages, header_crc32c))
 }
@@ -5518,6 +5531,10 @@ impl WalFileShared {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "encrypted_header_tests.rs"]
+mod encrypted_header_tests;
 
 #[cfg(test)]
 pub mod test {
