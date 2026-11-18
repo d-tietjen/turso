@@ -3873,6 +3873,8 @@ impl Wal for WalFile {
         self.coordination.rollback_cache(cache_rollback_frame);
         *self.last_checksum.write() = last_checksum;
         self.max_frame.store(max_frame, Ordering::Release);
+        self.has_unpublished_frames
+            .store(max_frame > snapshot.max_frame, Ordering::Release);
         if !is_savepoint {
             self.reset_internal_states();
         }
@@ -4129,8 +4131,8 @@ impl Wal for WalFile {
                     )
                 } else if snapshot != local_state.snapshot {
                     if self.has_unpublished_frames.load(Ordering::Acquire) {
-                        // write_frame_raw appended frames without a commit
-                        // marker (db_size == 0), so the coordination backend's
+                        // A spill or raw append wrote frames without a commit
+                        // marker, so the coordination backend's
                         // max_frame is behind our local max_frame. Chain from
                         // local state so we don't overwrite those frames.
                         (
@@ -4346,6 +4348,11 @@ impl Wal for WalFile {
 
         for (page, fid, csum) in &page_frame_and_checksum {
             self.complete_append_frame(page.get().id as u64, *fid, *csum);
+        }
+        if !page_frame_and_checksum.is_empty() {
+            // Cache flush and spill frames are private to the writer until
+            // commit. The commit must continue their frame and checksum chain.
+            self.has_unpublished_frames.store(true, Ordering::Release);
         }
 
         Ok(c)
