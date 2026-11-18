@@ -202,9 +202,12 @@ async fn verify_overlap(with_wal_tail: bool) {
     conn.execute("BEGIN IMMEDIATE", ())
         .await
         .expect("begin writer commit");
+    let before_flush = fs::metadata(&wal).expect("writer WAL").len();
     conn.execute("UPDATE parent SET value=32", ())
         .await
         .expect("stage next update");
+    conn.cacheflush().expect("flush uncommitted WAL frames");
+    assert!(fs::metadata(&wal).expect("staged WAL").len() > before_flush);
     fs::write(dir.path().join("writer-staged"), b"").expect("allow reader rollback");
     wait_for(&dir.path().join("reader-rolled-back"));
     conn.execute("COMMIT", ())

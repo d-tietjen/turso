@@ -463,6 +463,11 @@ enum CoordinationCheckpointGuardKind {
 
 /// Coordination operations that back the WAL's authoritative state.
 trait WalCoordination: Debug + Send + Sync {
+    /// Whether the handle can only participate in shared read snapshots.
+    fn is_overlap_reader(&self) -> bool {
+        false
+    }
+
     /// Load the current authoritative WAL snapshot.
     fn load_snapshot(&self) -> WalSnapshot;
 
@@ -1811,6 +1816,10 @@ impl ShmWalCoordination {
 
 #[cfg(host_shared_wal)]
 impl WalCoordination for ShmWalCoordination {
+    fn is_overlap_reader(&self) -> bool {
+        self.overlap_reader
+    }
+
     fn load_snapshot(&self) -> WalSnapshot {
         let snapshot = self.authority.snapshot();
         WalSnapshot {
@@ -2090,6 +2099,10 @@ impl WalCoordination for ShmWalCoordination {
     fn acquire_vacuum_checkpoint_guard_from_held_lock(
         &self,
     ) -> Result<CoordinationCheckpointGuardKind> {
+        if self.overlap_reader {
+            self.fallback.unlock_checkpoint_lock();
+            return Err(LimboError::ReadOnly);
+        }
         if !self.authority.try_acquire_checkpoint(self.owner) {
             self.fallback.unlock_checkpoint_lock();
             return Err(LimboError::Busy);
@@ -3989,6 +4002,9 @@ impl Wal for WalFile {
     }
 
     fn prepare_wal_start(&self, page_size: PageSize) -> Result<Option<Completion>> {
+        if self.coordination.is_overlap_reader() {
+            return Err(LimboError::ReadOnly);
+        }
         if self.coordination.wal_is_initialized() {
             return Ok(None);
         }
@@ -7232,6 +7248,10 @@ pub mod test {
             // Exercise the case where a lookup already passed the coverage
             // check before the writer published overflow.
             assert_eq!(wal.coordination.find_frame(7, 1, 1, None), Some(1));
+            assert!(matches!(
+                wal.prepare_wal_start(PageSize::new(4096).expect("fixture page size")),
+                Err(LimboError::ReadOnly)
+            ));
         }
 
         assert!(
