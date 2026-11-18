@@ -165,10 +165,10 @@ The reader uses the existing database, WAL, and `.tshm` coordinator. It can
 pin a committed snapshot while the writer continues. A truncating checkpoint
 may report busy until the reader ends its transaction. A concurrent checkpoint
 can require retrying the reader open. The reader requires a live shared peer
-with a compatible coordinator and usable shared frame index. It prevents SQL
-writes, checkpoints, vacuum and attachment of other databases. The application
-retains sole mutation custody in the existing writer and coordinates any future
-transfer.
+with a compatible coordinator and usable shared frame index. It prevents
+writes to shared backing, checkpoints, vacuum and attachment of other databases.
+The application retains sole mutation custody in the existing writer and
+coordinates any future transfer.
 
 ## Limitations
 

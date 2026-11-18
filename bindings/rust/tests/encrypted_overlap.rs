@@ -82,7 +82,18 @@ async fn encrypted_overlap_reader_process() {
         .is_err());
     conn.execute("BEGIN", ()).await.expect("start snapshot");
     assert_eq!(integer(&conn, "SELECT value FROM parent").await, 31);
+    conn.execute("SAVEPOINT pinned_read", ())
+        .await
+        .expect("reader savepoint");
     fs::write(dir.join("snapshot-pinned"), b"").expect("signal snapshot");
+    wait_for(&dir.join("writer-staged"));
+    conn.execute("ROLLBACK TO pinned_read", ())
+        .await
+        .expect("roll back reader savepoint locally");
+    conn.execute("RELEASE pinned_read", ())
+        .await
+        .expect("release reader savepoint");
+    fs::write(dir.join("reader-rolled-back"), b"").expect("signal reader rollback");
     wait_for(&dir.join("writer-committed"));
     assert_eq!(integer(&conn, "SELECT value FROM parent").await, 31);
     conn.execute("COMMIT", ()).await.expect("end snapshot");
@@ -188,9 +199,17 @@ async fn verify_overlap(with_wal_tail: bool) {
         conn.execute("INSERT INTO child VALUES(2)", ()).await,
         Err(Error::Constraint(_))
     ));
+    conn.execute("BEGIN IMMEDIATE", ())
+        .await
+        .expect("begin writer commit");
     conn.execute("UPDATE parent SET value=32", ())
         .await
-        .expect("next committed update");
+        .expect("stage next update");
+    fs::write(dir.path().join("writer-staged"), b"").expect("allow reader rollback");
+    wait_for(&dir.path().join("reader-rolled-back"));
+    conn.execute("COMMIT", ())
+        .await
+        .expect("commit staged update");
     conn.execute("CREATE TABLE committed_schema(value INTEGER)", ())
         .await
         .expect("concurrent schema change");

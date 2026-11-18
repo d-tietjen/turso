@@ -1387,7 +1387,8 @@ impl ShmWalCoordination {
         // and still have the old generation visible. Check custody after
         // publishing the slot so a later restart must observe it.
         let restart_in_progress = self.overlap_reader
-            && (self.authority.checkpoint_lock_active()
+            && (self.authority.frame_index_overflowed()
+                || self.authority.checkpoint_lock_active()
                 || (snapshot.max_frame != 0
                     && snapshot.max_frame == snapshot.nbackfills
                     && self.authority.writer_or_checkpoint_lock_active()));
@@ -1905,8 +1906,9 @@ impl WalCoordination for ShmWalCoordination {
     ) -> Option<u64> {
         // Exhausting the reserved shared index space leaves the authority
         // incomplete. Fall back to the local scanned cache rather than trusting
-        // a truncated shared index.
-        if self.authority.frame_index_overflowed() {
+        // a truncated shared index. Overlap readers admit only a complete
+        // prefix and use it for their already-pinned snapshot.
+        if !self.overlap_reader && self.authority.frame_index_overflowed() {
             return self
                 .fallback
                 .find_frame(page_id, min_frame, max_frame, frame_watermark);
@@ -2014,6 +2016,9 @@ impl WalCoordination for ShmWalCoordination {
     }
 
     fn try_begin_write_tx(&self) -> bool {
+        if self.overlap_reader {
+            return false;
+        }
         if !self.authority.try_acquire_writer(self.owner) {
             return false;
         }
@@ -2033,6 +2038,9 @@ impl WalCoordination for ShmWalCoordination {
         &self,
         mode: CheckpointMode,
     ) -> Result<CoordinationCheckpointGuardKind> {
+        if self.overlap_reader {
+            return Err(LimboError::ReadOnly);
+        }
         if !self.authority.try_acquire_checkpoint(self.owner) {
             return Err(LimboError::Busy);
         }
@@ -2279,12 +2287,15 @@ impl WalCoordination for ShmWalCoordination {
 
     fn rollback_cache(&self, max_frame: u64) {
         self.fallback.rollback_cache(max_frame);
-        self.authority.rollback_frames(max_frame);
+        // Read savepoints can roll back local state without owning the writer.
+        if !self.overlap_reader {
+            self.authority.rollback_frames(max_frame);
+        }
         self.clear_overflow_fallback_coverage();
     }
 
     fn should_checkpoint_on_close(&self) -> bool {
-        self.authority.is_last_process_mapping()
+        !self.overlap_reader && self.authority.is_last_process_mapping()
     }
 
     #[cfg(test)]
@@ -7170,6 +7181,18 @@ pub mod test {
     #[cfg(host_shared_wal)]
     #[test]
     fn test_shm_coordination_live_overflow_returns_busy_without_runtime_disk_scan() {
+        verify_live_index_overflow(false);
+    }
+
+    #[cfg(host_shared_wal)]
+    #[test]
+    fn test_overlap_reader_retains_pinned_frame_when_shared_index_overflows() {
+        verify_live_index_overflow(true);
+    }
+
+    /// Check the indexed prefix separately from the admission and fallback checks.
+    #[cfg(host_shared_wal)]
+    fn verify_live_index_overflow(overlap_reader: bool) {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test-live-overflow.db-wal");
         let shm_path = dir.path().join("test-live-overflow.db-tshm");
@@ -7200,11 +7223,16 @@ pub mod test {
             reopened_authority.clone(),
             ((0, 0), 0),
             buffer_pool,
-            false,
+            overlap_reader,
         );
 
         wal.begin_read_tx().unwrap();
         reopened_authority.mark_frame_index_overflowed_for_tests();
+        if overlap_reader {
+            // Exercise the case where a lookup already passed the coverage
+            // check before the writer published overflow.
+            assert_eq!(wal.coordination.find_frame(7, 1, 1, None), Some(1));
+        }
 
         assert!(
             matches!(wal.find_frame(7, None), Err(LimboError::Busy)),
