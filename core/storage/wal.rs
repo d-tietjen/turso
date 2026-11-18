@@ -4344,7 +4344,8 @@ impl Wal for WalFile {
         let file = self.coordination.wal_file()?;
         let c = file.pwritev(start_off, iovecs, c)?;
 
-        self.io.drain_completions(std::slice::from_ref(&c))?;
+        // Only successful writes may join the writer's private frame chain.
+        self.io.wait_for_completion(c.clone())?;
 
         for (page, fid, csum) in &page_frame_and_checksum {
             self.complete_append_frame(page.get().id as u64, *fid, *csum);
@@ -5694,6 +5695,7 @@ pub mod test {
     struct DeferredReadFile {
         inner: Arc<dyn File>,
         pending_reads: Mutex<Vec<(u64, Completion)>>,
+        fail_vectored_writes: bool,
     }
 
     impl DeferredReadFile {
@@ -5701,6 +5703,7 @@ pub mod test {
             Self {
                 inner,
                 pending_reads: Mutex::new(Vec::new()),
+                fail_vectored_writes: false,
             }
         }
 
@@ -5733,6 +5736,22 @@ pub mod test {
             c: Completion,
         ) -> crate::Result<Completion> {
             self.inner.pwrite(pos, buffer, c)
+        }
+
+        fn pwritev(
+            &self,
+            pos: u64,
+            buffers: Vec<Arc<Buffer>>,
+            c: Completion,
+        ) -> crate::Result<Completion> {
+            if self.fail_vectored_writes {
+                c.error(CompletionError::IOError(
+                    std::io::ErrorKind::Other,
+                    "fixture write",
+                ));
+                return Ok(c);
+            }
+            self.inner.pwritev(pos, buffers, c)
         }
 
         fn sync(
@@ -6023,6 +6042,28 @@ pub mod test {
             Err(LimboError::CompletionError(err)) => err,
             other => panic!("expected completion error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_failed_vectored_spill_preserves_private_frame_chain() {
+        let (_io, pool, wal) = make_initialized_memory_wal(4096);
+        let mut failing = DeferredReadFile::new(wal.wal_file().unwrap());
+        failing.fail_vectored_writes = true;
+        wal.coordination.shared_wal_state().write().runtime.file = Some(Arc::new(failing));
+        let before = wal.connection_state().snapshot;
+
+        let page = page_with_pattern(2, 42, &pool);
+        let failed = wal.append_frames_vectored(vec![page], PageSize::new(4096).unwrap());
+
+        assert!(matches!(
+            failed,
+            Err(LimboError::CompletionError(CompletionError::IOError(
+                std::io::ErrorKind::Other,
+                "fixture write"
+            )))
+        ));
+        assert_eq!(wal.connection_state().snapshot, before);
+        assert!(!wal.has_unpublished_frames.load(Ordering::Acquire));
     }
 
     #[test]
