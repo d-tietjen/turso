@@ -422,7 +422,7 @@ impl Database {
     not(miri)
 ))]
 pub mod encrypted_wal_handoff {
-    use super::{Database, EncryptedWalWriteBoundary, Result, TursoError};
+    use super::{Connection, Database, EncryptedWalWriteBoundary, Result, TursoError};
     pub use turso_core::{TransferId, WriterClaim, WriterId, WriterTransfer};
 
     /// Enroll a quiescent native writer before allowing any successor to attach.
@@ -455,6 +455,16 @@ pub mod encrypted_wal_handoff {
             .db_core()?
             .rollback_encrypted_wal_handoff(transfer)
             .map_err(TursoError::from)?)
+    }
+
+    /// Authenticate the original files from a live overlap reader and verify
+    /// the prepared position without consuming the reader's SQL snapshot.
+    pub fn verify_successor(
+        reader: &Connection,
+        previous: WriterClaim,
+        transfer: WriterTransfer,
+    ) -> Result<EncryptedWalWriteBoundary> {
+        reader.verify_encrypted_wal_successor(previous, transfer)
     }
 }
 

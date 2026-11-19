@@ -1186,6 +1186,23 @@ pub struct TursoConnection {
 }
 
 impl TursoConnection {
+    /// Verify a durable handoff on an authenticated native reader.
+    #[cfg(all(
+        feature = "encrypted-wal-handoff",
+        target_os = "linux",
+        target_pointer_width = "64",
+        not(miri)
+    ))]
+    pub fn verify_encrypted_wal_successor(
+        &self,
+        previous: turso_core::WriterClaim,
+        transfer: turso_core::WriterTransfer,
+    ) -> Result<turso_core::EncryptedWalWriteBoundary, TursoError> {
+        self.connection
+            .verify_encrypted_wal_successor(previous, transfer)
+            .map_err(TursoError::from)
+    }
+
     pub fn new(config: &TursoDatabaseConfig, connection: Arc<Connection>) -> Arc<Self> {
         Self::new_with_sync_busy(config, connection, None)
     }

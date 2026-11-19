@@ -2501,6 +2501,23 @@ impl Connection {
         Ok(())
     }
 
+    /// Verify a prepared handoff using this attached reader's encryption context.
+    /// The existing reader and its SQL snapshot remain usable after verification.
+    #[cfg(encrypted_wal_handoff)]
+    pub fn verify_encrypted_wal_successor(
+        &self,
+        previous: crate::WriterClaim,
+        transfer: crate::WriterTransfer,
+    ) -> Result<crate::EncryptedWalWriteBoundary> {
+        if self.is_closed() {
+            return Err(LimboError::InvalidArgument(
+                "handoff reader must be open".into(),
+            ));
+        }
+        self.db
+            .verify_encrypted_wal_successor(&self.pager.load(), previous, transfer)
+    }
+
     /// Disable every automatic WAL maintenance action for this connection
     /// (auto-checkpoint AND WAL header restart). Sync-engine consumers call
     /// this so they own all WAL bookkeeping themselves.

@@ -3286,6 +3286,38 @@ impl Database {
         result
     }
 
+    /// Reauthenticate the attached reader's original files and compare them
+    /// with the nominee and committed position in the prepared receipt.
+    #[cfg(encrypted_wal_handoff)]
+    pub(crate) fn verify_encrypted_wal_successor(
+        &self,
+        reader: &Pager,
+        previous: WriterClaim,
+        transfer: WriterTransfer,
+    ) -> Result<EncryptedWalWriteBoundary> {
+        if !self.is_encrypted_overlap_reader() || !self.io.supports_encrypted_wal_handoff() {
+            return Err(LimboError::InvalidArgument(
+                "handoff verification requires a native encrypted overlap reader".into(),
+            ));
+        }
+        let authority = self.shared_wal_coordination.get().ok_or_else(|| {
+            LimboError::InvalidArgument("the reader has no initialized shared WAL".into())
+        })?;
+        let mut lease = WriterLease::acquire(Path::new(&self.path))?;
+        lease.with_mutation_locks(authority.opened_file_id()?, |lease| {
+            let boundary = self.encrypted_boundary_under_locks(authority, false)?;
+            WalFileShared::authenticate_handoff_page_one(
+                &self.io,
+                &self.db_file,
+                reader,
+                authority,
+                &boundary.wal_position,
+            )?;
+            lease.verify_prepared(previous, transfer, boundary)?;
+            Ok(boundary)
+        })
+    }
+
     /// Sync a committed unmanaged encrypted WAL boundary for a control operation.
     /// The callback runs under both physical mutation locks and must avoid
     /// database re-entry. Managed writers use the durable receipt API.

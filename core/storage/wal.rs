@@ -5964,6 +5964,31 @@ impl WalFileShared {
         file.opened_file_id()
     }
 
+    /// Authenticate the reader's retained page one and any positive backfill
+    /// proof while both mutation bytes are held. This does not republish state.
+    #[cfg(encrypted_wal_handoff)]
+    pub(crate) fn authenticate_handoff_page_one(
+        io: &Arc<dyn IO>,
+        file: &Arc<dyn DatabaseStorage>,
+        reader: &Pager,
+        authority: &MappedSharedWalCoordination,
+        position: &[u8; SharedWalCoordinationHeader::BYTE_LEN],
+    ) -> Result<()> {
+        let snapshot = SharedWalCoordinationHeader::decode(position)?;
+        let identity = read_database_identity_from_storage(io, file, Some(reader))?
+            .ok_or(LimboError::NotADB)?;
+        if snapshot.nbackfills != 0 {
+            let matches =
+                |crc| authority.validate_backfill_proof(snapshot, identity.db_size_pages, crc);
+            if !matches(identity.header_crc32c)
+                && !identity.legacy_encoded_crc32c.is_some_and(matches)
+            {
+                return Err(LimboError::Busy);
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(host_shared_wal)]
     pub(crate) fn open_shared_from_authority_if_exists(
         io: &Arc<dyn IO>,

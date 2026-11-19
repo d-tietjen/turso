@@ -100,7 +100,7 @@ async fn encrypted_overlap_reader_process() {
         .await;
     if !matches!(
         mode.as_str(),
-        "reader" | "passive-backfill" | "write-boundary"
+        "reader" | "passive-backfill" | "write-boundary" | "managed-receipt"
     ) {
         assert!(result.is_err(), "role must refuse {mode}");
         return;
@@ -112,13 +112,36 @@ async fn encrypted_overlap_reader_process() {
         assert_eq!(integer(&conn, "SELECT value FROM parent").await, 31);
         return;
     }
-    if mode == "write-boundary" {
+    if matches!(mode.as_str(), "write-boundary" | "managed-receipt") {
         conn.execute("BEGIN", ())
             .await
             .expect("pin read transaction");
         assert_eq!(integer(&conn, "SELECT value FROM parent").await, 31);
         fs::write(dir.join("boundary-reader-pinned"), b"").expect("signal reader pin");
         wait_for(&dir.join("boundary-mutations-locked"));
+        #[cfg(all(feature = "encrypted-wal-handoff", not(miri)))]
+        if mode == "managed-receipt" {
+            use std::num::{NonZeroU128, NonZeroU64};
+            use turso::encrypted_wal_handoff as handoff;
+            let previous = handoff::WriterClaim {
+                owner: handoff::WriterId(NonZeroU128::MIN),
+                epoch: NonZeroU64::MIN,
+            };
+            let request = handoff::WriterTransfer {
+                id: handoff::TransferId(NonZeroU128::MIN),
+                successor: handoff::WriterId(NonZeroU128::new(2).expect("successor ID")),
+            };
+            let other = handoff::WriterTransfer {
+                successor: handoff::WriterId(NonZeroU128::new(3).expect("other ID")),
+                ..request
+            };
+            assert!(handoff::verify_successor(&conn, previous, other).is_err());
+            let report = handoff::verify_successor(&conn, previous, request)
+                .expect("verify nominated boundary");
+            fs::write(dir.join("boundary-receiver-position"), report.wal_position)
+                .expect("record verified boundary");
+            assert_reader_descriptors(dir);
+        }
         assert_eq!(integer(&conn, "SELECT value FROM parent").await, 31);
         fs::write(dir.join("boundary-reader-checked"), b"").expect("signal pinned read");
         wait_for(&dir.join("boundary-mutations-unlocked"));
@@ -479,7 +502,7 @@ async fn managed_encrypted_writer_rollback_preserves_separate_reader() {
     let owner = handoff::WriterId(NonZeroU128::MIN);
     handoff::enroll(&writer, owner).expect("enroll the native writer");
 
-    let mut reader = reader_process(directory.path(), "write-boundary")
+    let mut reader = reader_process(directory.path(), "managed-receipt")
         .spawn()
         .expect("start separate reader");
     wait_for(&directory.path().join("boundary-reader-pinned"));
@@ -494,6 +517,11 @@ async fn managed_encrypted_writer_rollback_preserves_separate_reader() {
     assert!(boundary.committed_frames > 0);
     fs::write(directory.path().join("boundary-mutations-locked"), b"").expect("signal prepared A");
     wait_for(&directory.path().join("boundary-reader-checked"));
+    assert_eq!(
+        fs::read(directory.path().join("boundary-receiver-position"))
+            .expect("the original boundary verified by B"),
+        boundary.wal_position
+    );
     assert!(matches!(
         conn.execute("UPDATE parent SET value=99", ()).await,
         Err(Error::Busy(_))
