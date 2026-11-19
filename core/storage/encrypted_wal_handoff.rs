@@ -17,7 +17,9 @@ use rustix::fs::{self, AtFlags, FileType, Mode, OFlags};
 use crate::io::{unix_shared_wal_lock_byte, FileId, SharedWalLockKind};
 use crate::{io_error, EncryptedWalWriteBoundary, LimboError, Result};
 
-use super::shared_wal_coordination::SharedWalCoordinationHeader;
+use super::shared_wal_coordination::{
+    SharedWalCoordinationHeader, CHECKPOINT_LOCK_OFFSET, WRITER_LOCK_OFFSET,
+};
 
 /// OFD byte reserved after the full range of `u32` reader-slot indices.
 const WRITER_LEASE_BYTE: u64 = 3 + u32::MAX as u64 + 1;
@@ -179,6 +181,46 @@ impl WriterLease {
         })
     }
 
+    /// Exclude checkpoint and writer mutations on the reader's original coordinator.
+    /// Both locks are released with the temporary descriptor, including when
+    /// acquisition or the action fails.
+    pub(crate) fn with_mutation_locks<T>(
+        &mut self,
+        reader_coordinator: FileId,
+        action: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let lock_file = open_file(&self.directory, &self.backing_names[2], OFlags::RDWR)
+            .map_err(|err| io_error(err, "open managed WAL mutation locks"))?;
+        let lock_metadata = lock_file
+            .metadata()
+            .map_err(|err| io_error(err, "stat WAL mutation locks"))?;
+        let lease_metadata = self
+            .coordinator
+            .metadata()
+            .map_err(|err| io_error(err, "stat WAL lease"))?;
+        let lock_id = (lock_metadata.dev(), lock_metadata.ino());
+        if !lock_metadata.is_file()
+            || lock_metadata.uid() != effective_uid()
+            || lock_metadata.nlink() != 1
+            || lock_id != (reader_coordinator.dev, reader_coordinator.ino)
+            || lock_id != (lease_metadata.dev(), lease_metadata.ino())
+        {
+            return Err(invalid_backing());
+        }
+        for offset in [CHECKPOINT_LOCK_OFFSET, WRITER_LOCK_OFFSET] {
+            if !unix_shared_wal_lock_byte(
+                lock_file.as_raw_fd(),
+                offset,
+                true,
+                false,
+                SharedWalLockKind::LinuxOfd,
+            )? {
+                return Err(LimboError::Busy);
+            }
+        }
+        action(self)
+    }
+
     /// Explicitly initialize an existing authenticated database exactly once.
     /// Existing receipts, including unreadable receipts, cannot be replaced.
     pub(crate) fn initialize(
@@ -274,13 +316,7 @@ impl WriterLease {
             self.sync_directory()?;
             return Ok(claim);
         }
-        if record.claim != previous
-            || record.prepared
-                != Some(PreparedTransfer {
-                    request: transfer,
-                    position: boundary.wal_position,
-                })
-        {
+        if !record.matches_prepared(previous, transfer, boundary.wal_position) {
             return Err(stale_writer());
         }
         record.claim = claim;
@@ -341,6 +377,21 @@ impl WriterLease {
             return Err(stale_writer());
         }
         self.sync_directory()
+    }
+
+    /// Match the still-prepared transfer and the successor's verified WAL boundary.
+    /// The caller holds both mutation locks. This check only reads the receipt.
+    pub(crate) fn verify_prepared(
+        &self,
+        previous: WriterClaim,
+        request: WriterTransfer,
+        boundary: EncryptedWalWriteBoundary,
+    ) -> Result<()> {
+        let record = self.verified_receipt(boundary)?;
+        if !record.matches_prepared(previous, request, boundary.wal_position) {
+            return Err(stale_writer());
+        }
+        Ok(())
     }
 
     /// Bind the receipt to current path identities and the actual open handles
@@ -446,6 +497,16 @@ impl WriterLease {
 }
 
 impl Receipt {
+    /// Match the exact predecessor, nominated successor, request ID, and WAL position.
+    fn matches_prepared(
+        &self,
+        predecessor: WriterClaim,
+        request: WriterTransfer,
+        position: [u8; SharedWalCoordinationHeader::BYTE_LEN],
+    ) -> bool {
+        self.claim == predecessor && self.prepared == Some(PreparedTransfer { request, position })
+    }
+
     /// Encode a versioned fixed-width record. Zero-valued IDs mark empty slots.
     fn encode(self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(RECEIPT_BYTES);
@@ -793,7 +854,14 @@ mod tests {
         drifted.wal_position = position.encode();
         assert!(successor.accept(a, transfer, drifted).is_err());
         let b = successor
-            .accept(a, transfer, boundary)
+            .with_mutation_locks(boundary.coordinator, |lease| {
+                assert!(lease.verify_prepared(a, wrong, boundary).is_err());
+                assert!(lease.verify_prepared(a, transfer, drifted).is_err());
+                lease.verify_prepared(a, transfer, boundary)?;
+                let accepted = lease.accept(a, transfer, boundary)?;
+                assert!(lease.verify_prepared(a, transfer, boundary).is_err());
+                Ok(accepted)
+            })
             .expect("accept durable receipt");
         assert_eq!(b.owner, owner(2));
         assert_eq!(b.epoch.get(), 2);
@@ -820,6 +888,58 @@ mod tests {
         assert!(retry.verify_active(a, boundary).is_err());
         assert!(retry.rollback(a, transfer, boundary).is_err());
         assert!(retry.prepare(a, transfer, boundary, || {}).is_err());
+    }
+
+    #[test]
+    fn mutation_locks_release_on_contention_and_callback_error() {
+        let directory = private_directory();
+        let path = directory.path().join(DB_NAME);
+        let (_db, boundary) = encrypted_boundary(&path);
+        let mut lease = WriterLease::acquire(&path).expect("acquire writer lease");
+        let coordinator = directory.path().join(&lease.backing_names[2]);
+        let before = std::fs::read(&coordinator).expect("read coordinator");
+        let open_contender = || File::options().read(true).write(true).open(&coordinator);
+        let try_lock = |file: &File, offset| {
+            unix_shared_wal_lock_byte(
+                file.as_raw_fd(),
+                offset,
+                true,
+                false,
+                SharedWalLockKind::LinuxOfd,
+            )
+            .expect("try mutation lock")
+        };
+
+        let contender = open_contender().expect("open competing description");
+        assert!(try_lock(&contender, WRITER_LOCK_OFFSET));
+        let result: Result<()> = lease.with_mutation_locks(boundary.coordinator, |_| {
+            panic!("entered with a competing writer")
+        });
+        assert!(matches!(result, Err(LimboError::Busy)));
+        assert!(try_lock(&contender, CHECKPOINT_LOCK_OFFSET));
+        drop(contender);
+
+        let wrong_id = FileId {
+            ino: boundary.coordinator.ino ^ 1,
+            ..boundary.coordinator
+        };
+        let result: Result<()> =
+            lease.with_mutation_locks(wrong_id, |_| panic!("entered with a different coordinator"));
+        assert!(matches!(result, Err(LimboError::InvalidArgument(_))));
+
+        let contender = open_contender().expect("open competing description");
+        let result: Result<()> = lease.with_mutation_locks(boundary.coordinator, |_| {
+            assert!(!try_lock(&contender, CHECKPOINT_LOCK_OFFSET));
+            assert!(!try_lock(&contender, WRITER_LOCK_OFFSET));
+            Err(LimboError::ReadOnly)
+        });
+        assert!(matches!(result, Err(LimboError::ReadOnly)));
+        assert!(try_lock(&contender, CHECKPOINT_LOCK_OFFSET));
+        assert!(try_lock(&contender, WRITER_LOCK_OFFSET));
+        assert_eq!(
+            before,
+            std::fs::read(&coordinator).expect("unchanged coordinator")
+        );
     }
 
     #[test]

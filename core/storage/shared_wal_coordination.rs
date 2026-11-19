@@ -56,9 +56,9 @@ const SHARED_WAL_COORDINATION_MAP_ALIGNMENT: usize = 4096;
 /// Byte 0: lifetime lock used only to detect whether another process is present.
 const PROCESS_LIFETIME_LOCK_OFFSET: u64 = 0;
 /// Byte 1: single-writer ownership byte.
-const WRITER_LOCK_OFFSET: u64 = 1;
+pub(super) const WRITER_LOCK_OFFSET: u64 = 1;
 /// Byte 2: single-checkpointer ownership byte.
-const CHECKPOINT_LOCK_OFFSET: u64 = 2;
+pub(super) const CHECKPOINT_LOCK_OFFSET: u64 = 2;
 /// Byte range starting at 3: one reader-byte lock per shared reader slot.
 const READER_LOCK_START_OFFSET: u64 = 3;
 /// Entries per frame-index block in the append-only shared page->frame index.
