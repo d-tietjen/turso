@@ -14,12 +14,7 @@ pub(crate) mod btree;
 pub(crate) mod buffer_pool;
 pub(crate) mod checksum;
 pub mod database;
-#[cfg(all(
-    host_shared_wal,
-    target_os = "linux",
-    feature = "encryption",
-    not(miri)
-))]
+#[cfg(encrypted_wal_handoff)]
 pub(crate) mod encrypted_wal_handoff;
 pub(crate) mod encryption;
 pub(crate) mod journal_mode;

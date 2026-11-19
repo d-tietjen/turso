@@ -2284,7 +2284,7 @@ impl Connection {
     /// If attempt to write frame at the position `frame_no` will create gap in the WAL - method will return error
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
-        if self.db.is_encrypted_overlap_reader() {
+        if self.db.is_encrypted_overlap_reader() || self.db.is_managed_wal_writer() {
             return Err(LimboError::ReadOnly);
         }
         self.pager.load().wal_insert_frame(frame_no, frame)
@@ -2293,7 +2293,7 @@ impl Connection {
     /// Start WAL session by initiating read+write transaction for this connection
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_insert_begin(&self) -> Result<()> {
-        if self.db.is_encrypted_overlap_reader() {
+        if self.db.is_encrypted_overlap_reader() || self.db.is_managed_wal_writer() {
             return Err(LimboError::ReadOnly);
         }
         let pager = self.pager.load();
@@ -2324,7 +2324,7 @@ impl Connection {
     pub fn wal_insert_end(self: &Arc<Connection>, force_commit: bool) -> Result<()> {
         use crate::{return_if_io, types::IOResult};
 
-        if self.db.is_encrypted_overlap_reader() {
+        if self.db.is_encrypted_overlap_reader() || self.db.is_managed_wal_writer() {
             return Err(LimboError::ReadOnly);
         }
         {

@@ -23,6 +23,8 @@
 //! conservatism, never correctness: if the authority cannot prove a slot is
 //! dead, it must leave that slot in place.
 
+#[cfg(encrypted_wal_handoff)]
+use crate::sync::atomic::AtomicU8;
 use crate::{
     io::{Completion, File, FileSyncType, OpenFlags, SharedWalLockKind, SharedWalMappedRegion, IO},
     sync::{
@@ -116,6 +118,17 @@ struct LocalLockState {
     writer_lock_held: bool,
     checkpoint_lock_held: bool,
     reader_locks: Vec<usize>,
+}
+
+/// Process-local admission state for an encrypted writer using a durable receipt.
+#[cfg(encrypted_wal_handoff)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum ManagedWalMode {
+    #[default]
+    Ordinary,
+    Active,
+    Fenced,
 }
 
 /// Per-connection ownership bookkeeping within a single process.
@@ -681,6 +694,9 @@ pub(crate) struct MappedSharedWalCoordination {
     process_local_ownership: Arc<Mutex<ProcessLocalOwnershipState>>,
     /// Per-mapping lock counts used to make `Drop` and stale probing precise.
     local_lock_state: Mutex<LocalLockState>,
+    /// Local writer permission changed only under both OFD mutation locks.
+    #[cfg(encrypted_wal_handoff)]
+    managed_mode: AtomicU8,
     open_mode: SharedWalCoordinationOpenMode,
     /// Whether exclusive open had to discard an invalid persisted backfill proof.
     sanitized_backfill_proof_on_open: bool,
@@ -815,6 +831,8 @@ impl MappedSharedWalCoordination {
                 checkpoint_lock_held: false,
                 reader_locks: vec![0; reader_slot_count as usize],
             }),
+            #[cfg(encrypted_wal_handoff)]
+            managed_mode: AtomicU8::new(ManagedWalMode::Ordinary as u8),
             open_mode,
             sanitized_backfill_proof_on_open: false,
             registry_path: None,
@@ -1287,15 +1305,29 @@ impl MappedSharedWalCoordination {
     /// Run a bounded transition under the actual writer and checkpoint locks.
     pub(crate) fn with_handoff_locks<T>(&self, action: impl FnOnce() -> Result<T>) -> Result<T> {
         let owner = self.owner_record();
-        if !self.try_acquire_checkpoint(owner) {
+        if !self.try_acquire_checkpoint_inner(owner, true) {
             return Err(LimboError::Busy);
         }
-        if !self.try_acquire_writer(owner) {
+        if !self.try_acquire_writer_inner(owner, true) {
             self.release_checkpoint(owner);
             return Err(LimboError::Busy);
         }
         let _locks = SharedWalHandoffLocks { authority: self };
         action()
+    }
+
+    /// Change local admission while holding both physical mutation locks.
+    #[cfg(encrypted_wal_handoff)]
+    pub(crate) fn set_managed_mode(&self, mode: ManagedWalMode) {
+        let local = self.local_lock_state.lock();
+        turso_assert!(local.writer_lock_held && local.checkpoint_lock_held);
+        self.managed_mode.store(mode as u8, Ordering::Release);
+    }
+
+    /// Whether this mapping belongs to a writer with a managed receipt.
+    #[cfg(encrypted_wal_handoff)]
+    pub(crate) fn managed(&self) -> bool {
+        self.managed_mode.load(Ordering::Acquire) != ManagedWalMode::Ordinary as u8
     }
 
     /// Identify the open coordination mapping independently of its current pathname.
@@ -1794,7 +1826,16 @@ impl MappedSharedWalCoordination {
 
     /// Attempt to acquire the writer lock for this mapping.
     pub(crate) fn try_acquire_writer(&self, owner: SharedOwnerRecord) -> bool {
+        self.try_acquire_writer_inner(owner, false)
+    }
+
+    /// Acquire the real writer byte, optionally for a local receipt transition.
+    fn try_acquire_writer_inner(&self, owner: SharedOwnerRecord, _handoff: bool) -> bool {
         let mut local = self.local_lock_state.lock();
+        #[cfg(encrypted_wal_handoff)]
+        if !_handoff && self.managed_mode.load(Ordering::Relaxed) == ManagedWalMode::Fenced as u8 {
+            return false;
+        }
         if local.writer_lock_held {
             return false;
         }
@@ -1921,7 +1962,16 @@ impl MappedSharedWalCoordination {
 
     /// Attempt to acquire the checkpoint lock for this mapping.
     pub(crate) fn try_acquire_checkpoint(&self, owner: SharedOwnerRecord) -> bool {
+        self.try_acquire_checkpoint_inner(owner, false)
+    }
+
+    /// Acquire the real checkpoint byte, optionally for a local receipt transition.
+    fn try_acquire_checkpoint_inner(&self, owner: SharedOwnerRecord, _handoff: bool) -> bool {
         let mut local = self.local_lock_state.lock();
+        #[cfg(encrypted_wal_handoff)]
+        if !_handoff && self.managed_mode.load(Ordering::Relaxed) == ManagedWalMode::Fenced as u8 {
+            return false;
+        }
         if local.checkpoint_lock_held {
             return false;
         }

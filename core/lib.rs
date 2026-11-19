@@ -157,6 +157,8 @@ pub use io::{
 };
 pub use numeric::{nonnan::NonNan, Numeric};
 pub use statement::{ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter};
+#[cfg(encrypted_wal_handoff)]
+pub use storage::encrypted_wal_handoff::{TransferId, WriterClaim, WriterId, WriterTransfer};
 pub use storage::{
     buffer_pool::BufferPool,
     database::{DatabaseStorage, IOContext},

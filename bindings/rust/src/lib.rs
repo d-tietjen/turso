@@ -414,6 +414,50 @@ impl Database {
     }
 }
 
+/// Lifecycle controls for an embedded AES-256-GCM database on 64-bit Linux.
+#[cfg(all(
+    feature = "encrypted-wal-handoff",
+    target_os = "linux",
+    target_pointer_width = "64",
+    not(miri)
+))]
+pub mod encrypted_wal_handoff {
+    use super::{Database, EncryptedWalWriteBoundary, Result, TursoError};
+    pub use turso_core::{TransferId, WriterClaim, WriterId, WriterTransfer};
+
+    /// Enroll a quiescent native writer before allowing any successor to attach.
+    /// The controller must already own the private backing and exclude other writers.
+    pub fn enroll(database: &Database, owner: WriterId) -> Result<WriterClaim> {
+        Ok(database
+            .inner
+            .db_core()?
+            .enroll_encrypted_wal_writer(owner)
+            .map_err(TursoError::from)?)
+    }
+
+    /// Publish the exact boundary and fence the predecessor. A live writer or
+    /// checkpoint returns Busy so the controller can finish draining it.
+    pub fn prepare(
+        database: &Database,
+        transfer: WriterTransfer,
+    ) -> Result<EncryptedWalWriteBoundary> {
+        Ok(database
+            .inner
+            .db_core()?
+            .prepare_encrypted_wal_handoff(transfer)
+            .map_err(TursoError::from)?)
+    }
+
+    /// Reactivate the predecessor if the transfer has never been accepted.
+    pub fn rollback(database: &Database, transfer: WriterTransfer) -> Result<()> {
+        Ok(database
+            .inner
+            .db_core()?
+            .rollback_encrypted_wal_handoff(transfer)
+            .map_err(TursoError::from)?)
+    }
+}
+
 /// A prepared statement.
 #[derive(Clone)]
 pub struct Statement {

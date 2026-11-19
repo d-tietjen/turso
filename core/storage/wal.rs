@@ -488,6 +488,12 @@ enum CoordinationCheckpointGuardKind {
 
 /// Coordination operations that back the WAL's authoritative state.
 trait WalCoordination: Debug + Send + Sync {
+    /// Whether the backing is enrolled in managed writer handoff.
+    #[cfg(encrypted_wal_handoff)]
+    fn has_managed_writer(&self) -> bool {
+        false
+    }
+
     /// Whether the handle is restricted to read snapshots.
     fn is_overlap_reader(&self) -> bool {
         false
@@ -630,6 +636,12 @@ trait WalCoordination: Debug + Send + Sync {
 /// Write-ahead log (WAL).
 #[aristo::intent("The WAL subsystem maintains LSN monotonicity, frame commitment ordering, recovery idempotency, checkpoint safety, and group commit atomicity.", id = "wal_protocol_correctness", verify = "neural")]
 pub trait Wal: Debug + Send + Sync {
+    /// Managed handles never use caller-driven raw WAL mutation or shutdown sync.
+    #[cfg(encrypted_wal_handoff)]
+    fn has_managed_writer(&self) -> bool {
+        false
+    }
+
     /// Begin a read transaction.
     /// Returns whether the database state has changed since the last read transaction.
     fn begin_read_tx(&self) -> Result<bool>;
@@ -1525,7 +1537,11 @@ impl ShmWalCoordination {
             active_reader: Mutex::new(None),
             overlap_reader,
         };
-        if !overlap_reader {
+        #[cfg(encrypted_wal_handoff)]
+        let seed_authority = !overlap_reader && !coordination.has_managed_writer();
+        #[cfg(not(encrypted_wal_handoff))]
+        let seed_authority = !overlap_reader;
+        if seed_authority {
             coordination.seed_or_sync_authority();
         }
         coordination
@@ -1948,6 +1964,11 @@ impl ShmWalCoordination {
 
 #[cfg(host_shared_wal)]
 impl WalCoordination for ShmWalCoordination {
+    #[cfg(encrypted_wal_handoff)]
+    fn has_managed_writer(&self) -> bool {
+        self.authority.managed()
+    }
+
     fn is_overlap_reader(&self) -> bool {
         self.overlap_reader
     }
@@ -2473,6 +2494,10 @@ impl WalCoordination for ShmWalCoordination {
     }
 
     fn should_checkpoint_on_close(&self) -> bool {
+        #[cfg(encrypted_wal_handoff)]
+        if self.has_managed_writer() {
+            return false;
+        }
         !self.overlap_reader && self.authority.is_last_process_mapping()
     }
 
@@ -3240,6 +3265,15 @@ fn pack_checksum(checksum: (u32, u32)) -> u64 {
 }
 
 impl WalFile {
+    /// Require an existing writer lock for direct WAL mutations in this profile.
+    #[cfg(encrypted_wal_handoff)]
+    fn require_managed_write_lock(&self) -> Result<()> {
+        if self.has_managed_writer() && !self.holds_write_lock() {
+            return Err(LimboError::ReadOnly);
+        }
+        Ok(())
+    }
+
     fn prepare_transformed_frame(
         buffer_pool: &Arc<BufferPool>,
         wal_header: &WalHeader,
@@ -3649,6 +3683,11 @@ impl Wal for WalFile {
         self.coordination.should_checkpoint_on_close()
     }
 
+    #[cfg(encrypted_wal_handoff)]
+    fn has_managed_writer(&self) -> bool {
+        self.coordination.has_managed_writer()
+    }
+
     /// Find the latest frame containing a page.
     #[instrument(skip_all, level = Level::DEBUG)]
     #[aristo::intent(
@@ -4033,6 +4072,10 @@ impl Wal for WalFile {
         page: &[u8],
         sync_type: FileSyncType,
     ) -> Result<()> {
+        #[cfg(encrypted_wal_handoff)]
+        if self.has_managed_writer() {
+            return Err(LimboError::ReadOnly);
+        }
         let Some(page_size) = PageSize::new(page.len() as u32) else {
             bail_corrupt_error!("invalid page size: {}", page.len());
         };
@@ -4206,6 +4249,16 @@ impl Wal for WalFile {
 
     #[instrument(err, skip_all, level = Level::DEBUG)]
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion> {
+        #[cfg(encrypted_wal_handoff)]
+        let _managed_checkpoint = if self.has_managed_writer() && !self.holds_write_lock() {
+            let checkpoint = self.checkpoint_guard.read();
+            if checkpoint.is_none() {
+                return Err(LimboError::ReadOnly);
+            }
+            Some(checkpoint)
+        } else {
+            None
+        };
         tracing::debug!("wal_sync");
         let syncing = self.syncing.clone();
         let dirty = self.dirty.clone();
@@ -4270,6 +4323,10 @@ impl Wal for WalFile {
     #[instrument(skip_all, level = Level::DEBUG)]
 
     fn rollback(&self, rollback_to: Option<RollbackTo>) {
+        #[cfg(encrypted_wal_handoff)]
+        if self.require_managed_write_lock().is_err() {
+            return;
+        }
         if self.coordination.is_overlap_reader() {
             // Reader savepoints do not own any WAL frames.
             return;
@@ -4329,6 +4386,10 @@ impl Wal for WalFile {
     }
 
     fn try_begin_vacuum_checkpoint_lock(&self) -> Result<()> {
+        #[cfg(encrypted_wal_handoff)]
+        if self.has_managed_writer() {
+            return Err(LimboError::ReadOnly);
+        }
         self.with_shared(|shared| {
             if !shared.runtime.checkpoint_lock.write() {
                 return Err(LimboError::Busy);
@@ -4344,6 +4405,10 @@ impl Wal for WalFile {
     }
 
     fn begin_vacuum_blocking_tx(&self) -> Result<()> {
+        #[cfg(encrypted_wal_handoff)]
+        if self.has_managed_writer() {
+            return Err(LimboError::ReadOnly);
+        }
         if self.coordination.is_overlap_reader() {
             return Err(LimboError::ReadOnly);
         }
@@ -4449,6 +4514,8 @@ impl Wal for WalFile {
     }
 
     fn prepare_wal_start(&self, page_size: PageSize) -> Result<Option<Completion>> {
+        #[cfg(encrypted_wal_handoff)]
+        self.require_managed_write_lock()?;
         if self.coordination.is_overlap_reader() {
             return Err(LimboError::ReadOnly);
         }
@@ -4501,6 +4568,8 @@ impl Wal for WalFile {
         parent = "wal_protocol_correctness"
     )]
     fn prepare_wal_finish(&self, sync_type: FileSyncType) -> Result<Completion> {
+        #[cfg(encrypted_wal_handoff)]
+        self.require_managed_write_lock()?;
         let file = self.coordination.wal_file()?;
         let coordination = self.coordination.clone();
         let c = file.sync(
@@ -5356,6 +5425,8 @@ impl WalFile {
     /// 3. nbackfills > 0 - otherwise nothing was backfilled and there is no reason to truncate header
     /// 4. max_frame == nbackfills - otherwise there are some non-checkpointed frames in the WAL and we can't truncate the log
     pub fn try_restart_log_before_write(&self) -> Result<()> {
+        #[cfg(encrypted_wal_handoff)]
+        self.require_managed_write_lock()?;
         let max_frame_read_lock_index = self.max_frame_read_lock_index.load(Ordering::Acquire);
         if max_frame_read_lock_index != 0 {
             tracing::debug!(
@@ -5872,13 +5943,24 @@ impl WalFileShared {
         file: &Arc<dyn crate::io::File>,
         snapshot: SharedWalCoordinationHeader,
     ) -> Result<crate::io::FileId> {
+        let identity = Self::verify_handoff_boundary(io, file, snapshot)?;
+        io.wait_for_completion(file.sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)?)?;
+        Ok(identity)
+    }
+
+    /// Verify a committed physical WAL under both mutation locks without repair.
+    #[cfg(host_shared_wal)]
+    pub(crate) fn verify_handoff_boundary(
+        io: &Arc<dyn IO>,
+        file: &Arc<dyn crate::io::File>,
+        snapshot: SharedWalCoordinationHeader,
+    ) -> Result<crate::io::FileId> {
         if !matches!(
             classify_authority_snapshot_against_wal(io, file, snapshot)?,
             AuthoritySnapshotValidation::Trusted
         ) {
             return Err(LimboError::Busy);
         }
-        io.wait_for_completion(file.sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)?)?;
         file.opened_file_id()
     }
 

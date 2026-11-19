@@ -65,12 +65,7 @@ mod common;
 mod completions;
 pub use clock::Clock;
 pub use completions::*;
-#[cfg(all(
-    host_shared_wal,
-    target_os = "linux",
-    feature = "encryption",
-    not(miri)
-))]
+#[cfg(encrypted_wal_handoff)]
 pub(crate) use unix::unix_shared_wal_lock_byte;
 
 /// Platform-independent file identity, analogous to SQLite's `struct unixFileId`.
@@ -444,6 +439,12 @@ impl Default for OpenFlags {
 }
 
 pub trait IO: Clock + Send + Sync {
+    /// Whether managed handoff can rely on native file identity and synchronous writes.
+    #[cfg(encrypted_wal_handoff)]
+    fn supports_encrypted_wal_handoff(&self) -> bool {
+        false
+    }
+
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>>;
 
     fn open_shared_wal_file(&self, path: &str) -> Result<Arc<dyn File>> {

@@ -43,6 +43,11 @@ impl Clock for UnixIO {
 }
 
 impl IO for UnixIO {
+    #[cfg(encrypted_wal_handoff)]
+    fn supports_encrypted_wal_handoff(&self) -> bool {
+        true
+    }
+
     fn supports_shared_wal_coordination(&self) -> bool {
         true
     }

@@ -28,25 +28,45 @@ const RECEIPT_BYTES: usize = 8 + 8 + 6 * 16 + 1 + 3 * 16 + SharedWalCoordination
 
 /// Stable identity supplied by the controller for one writer incarnation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct WriterId(pub(crate) NonZeroU128);
+pub struct WriterId(pub NonZeroU128);
 
 /// Per-database transfer ID. Each new request must use a higher value, even
 /// when the preceding request rolled back without advancing the writer epoch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct TransferId(pub(crate) NonZeroU128);
+pub struct TransferId(pub NonZeroU128);
 
 /// Owner and monotonically increasing epoch from the durable receipt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct WriterClaim {
-    pub(crate) owner: WriterId,
-    pub(crate) epoch: NonZeroU64,
+pub struct WriterClaim {
+    /// Writer incarnation named by the controller.
+    pub owner: WriterId,
+    /// Ownership generation that advances only when a successor accepts.
+    pub epoch: NonZeroU64,
 }
 
 /// Request to transfer one writer epoch to the named successor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct WriterTransfer {
-    pub(crate) id: TransferId,
-    pub(crate) successor: WriterId,
+pub struct WriterTransfer {
+    /// Per-database sequence of this transfer request.
+    pub id: TransferId,
+    /// Only the nominated writer can accept the transfer.
+    pub successor: WriterId,
+}
+
+/// Live predecessor handle. A prepared writer has no lease and stays fenced
+/// until the exact pending request is rolled back.
+pub(crate) struct ManagedWriter {
+    pub(crate) claim: WriterClaim,
+    pub(crate) lease: Option<WriterLease>,
+    pub(crate) pending: Option<PendingWriterTransfer>,
+    /// Latest confirmed rollback, for a retry at this open writer.
+    pub(crate) last_rollback: Option<WriterTransfer>,
+}
+
+/// Exact pending operation retained for retry and rollback in the predecessor.
+pub(crate) struct PendingWriterTransfer {
+    pub(crate) request: WriterTransfer,
+    pub(crate) boundary: EncryptedWalWriteBoundary,
 }
 
 /// Database, WAL, and coordinator file identities in that order.
@@ -167,7 +187,17 @@ impl WriterLease {
         boundary: EncryptedWalWriteBoundary,
     ) -> Result<WriterClaim> {
         let backing = self.verify_backing(boundary)?;
-        if self.load()?.is_some() {
+        if let Some(existing) = self.load()? {
+            let same_owner =
+                existing.claim.owner == owner && existing.claim.epoch == NonZeroU64::MIN;
+            if same_owner
+                && existing.backing == backing
+                && existing.prepared.is_none()
+                && existing.resolved.is_none()
+            {
+                self.sync_directory()?;
+                return Ok(existing.claim);
+            }
             return Err(LimboError::Conflict(
                 "WAL writer receipt already exists".into(),
             ));
@@ -192,6 +222,7 @@ impl WriterLease {
         claim: WriterClaim,
         transfer: WriterTransfer,
         boundary: EncryptedWalWriteBoundary,
+        before_publish: impl FnOnce(),
     ) -> Result<()> {
         let mut record = self.verified_receipt(boundary)?;
         if claim != record.claim
@@ -210,8 +241,10 @@ impl WriterLease {
             if existing != pending {
                 return Err(stale_writer());
             }
+            before_publish();
             return self.sync_directory();
         }
+        before_publish();
         record.prepared = Some(pending);
         self.publish(record)
     }
@@ -257,8 +290,8 @@ impl WriterLease {
         Ok(claim)
     }
 
-    /// Restore the predecessor before acceptance and only at the prepared
-    /// committed boundary. An accepted epoch cannot be rolled back by A.
+    /// Cancel a transition started by the predecessor at the exact boundary.
+    /// Cancellation is durable even if the preparation failed before publication.
     pub(crate) fn rollback(
         &mut self,
         claim: WriterClaim,
@@ -274,14 +307,22 @@ impl WriterLease {
         if record.claim == claim && record.resolved == Some(result) && record.prepared.is_none() {
             return self.sync_directory();
         }
-        if record.claim != claim
-            || record.prepared
-                != Some(PreparedTransfer {
-                    request: transfer,
-                    position: boundary.wal_position,
-                })
-        {
+        if record.claim != claim || transfer.successor == claim.owner {
             return Err(stale_writer());
+        }
+        match record.prepared {
+            Some(pending)
+                if pending.request == transfer && pending.position == boundary.wal_position =>
+            {
+                ()
+            }
+            None if record
+                .resolved
+                .is_none_or(|finished| finished.request.id < transfer.id) =>
+            {
+                ()
+            }
+            _ => return Err(stale_writer()),
         }
         record.resolved = Some(result);
         record.prepared = None;
@@ -531,6 +572,20 @@ fn with_suffix(name: &std::ffi::OsStr, suffix: &str) -> OsString {
     joined
 }
 
+/// A normal writable open must refuse an existing managed database before
+/// it can reuse a registered handle or repair the WAL and coordinator.
+pub(crate) fn reject_unmanaged_open(path: &str) -> Result<()> {
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| Path::new(path).to_owned());
+    let receipt = with_suffix(path.as_os_str(), "-tshm.owner");
+    match std::fs::symlink_metadata(receipt) {
+        Ok(_) => Err(LimboError::Conflict(
+            "managed WAL requires explicit writer admission".into(),
+        )),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(io_error(err, "inspect managed WAL receipt")),
+    }
+}
+
 /// Open a receipt or coordinator under the trusted directory descriptor.
 fn open_file(directory: &File, name: &OsString, flags: OFlags) -> std::io::Result<File> {
     fs::openat(
@@ -579,6 +634,116 @@ mod tests {
     const CHILD_DIRECTORY: &str = "TURSO_WAL_WRITER_LEASE_TEST_DIR";
 
     #[test]
+    fn managed_predecessor_drains_and_rolls_back_or_stays_fenced() {
+        let directory = private_directory();
+        let path = directory.path().join(DB_NAME);
+        let (db, _) = encrypted_boundary(&path);
+        let a = db
+            .enroll_encrypted_wal_writer(owner(1))
+            .expect("enroll existing writer");
+        let conn = db.connect().expect("writer connection");
+        assert!(db
+            .prepare_encrypted_wal_handoff(transfer(1, a.owner))
+            .is_err());
+        conn.execute("INSERT INTO records VALUES (40)")
+            .expect("invalid request leaves writer active");
+
+        let unpublished = transfer(1, owner(2));
+        let staging = directory.path().join("handoff.db-tshm.owner.pending");
+        std::fs::create_dir(&staging).expect("stage publication failure");
+        assert!(db.prepare_encrypted_wal_handoff(unpublished).is_err());
+        assert!(matches!(
+            conn.execute("INSERT INTO records VALUES (41)"),
+            Err(LimboError::Busy)
+        ));
+        std::fs::remove_dir(staging).expect("clear failed staging path");
+        db.rollback_encrypted_wal_handoff(unpublished)
+            .expect("cancel the unpublished request durably");
+        assert!(db.rollback_encrypted_wal_handoff(unpublished).is_ok());
+        assert!(db.prepare_encrypted_wal_handoff(unpublished).is_err());
+
+        let first = transfer(2, owner(2));
+        conn.execute("BEGIN IMMEDIATE").expect("begin transaction");
+        conn.execute("INSERT INTO records VALUES (43)")
+            .expect("write inside transaction");
+        assert!(matches!(
+            db.prepare_encrypted_wal_handoff(first),
+            Err(LimboError::Busy)
+        ));
+        conn.execute("COMMIT")
+            .expect("finish the eligible transaction");
+        let initial = db
+            .prepare_encrypted_wal_handoff(first)
+            .expect("drained A prepares");
+        assert_eq!(
+            db.prepare_encrypted_wal_handoff(first)
+                .expect("same prepared boundary"),
+            initial
+        );
+        assert!(matches!(
+            conn.execute("INSERT INTO records VALUES (44)"),
+            Err(LimboError::Busy)
+        ));
+        assert!(matches!(
+            conn.checkpoint(crate::CheckpointMode::Truncate {
+                upper_bound_inclusive: None
+            }),
+            Err(LimboError::Busy)
+        ));
+        assert!(conn.cacheflush().is_err());
+        assert!(db.with_encrypted_wal_write_boundary(|_| ()).is_err());
+        assert!(Database::check_handoff_open(path.to_str().expect("fixture path"), false).is_err());
+        assert!(Database::check_handoff_open(path.to_str().expect("fixture path"), true).is_ok());
+        db.rollback_encrypted_wal_handoff(first)
+            .expect("restore A before acceptance");
+        assert!(db.rollback_encrypted_wal_handoff(first).is_ok());
+        conn.execute("INSERT INTO records VALUES (45)")
+            .expect("A writes after rollback");
+        assert!(
+            conn.checkpoint(crate::CheckpointMode::Passive {
+                upper_bound_inclusive: None
+            })
+            .expect("active writer can checkpoint pending frames")
+            .wal_checkpoint_backfilled
+                > 0
+        );
+
+        let second = transfer(3, owner(2));
+        let boundary = db
+            .prepare_encrypted_wal_handoff(second)
+            .expect("prepare another request");
+        let mut b = WriterLease::acquire(&path).expect("take released lease");
+        assert_eq!(
+            b.accept(a, second, boundary).expect("accept as B").owner,
+            owner(2)
+        );
+        drop(b);
+        assert!(db.rollback_encrypted_wal_handoff(second).is_err());
+        assert!(matches!(
+            conn.execute("INSERT INTO records VALUES (46)"),
+            Err(LimboError::Busy)
+        ));
+        let wal_path = directory.path().join("handoff.db-wal");
+        let wal_length = std::fs::metadata(&wal_path)
+            .expect("wal before close")
+            .len();
+        assert!(wal_length > 0);
+        let new_conn = db
+            .connect()
+            .expect("A can still read with a new connection");
+        assert!(new_conn.query("SELECT i FROM records").is_ok());
+        new_conn.close().expect("close new reader");
+        conn.close()
+            .expect("fenced last close releases local resources");
+        assert_eq!(
+            std::fs::metadata(wal_path)
+                .expect("retained WAL after close")
+                .len(),
+            wal_length
+        );
+    }
+
+    #[test]
     fn prepared_receipt_survives_lease_process_exit_and_accepts_once() {
         let directory = private_directory();
         let path = directory.path().join(DB_NAME);
@@ -587,9 +752,9 @@ mod tests {
         let a = lease.initialize(owner(1), boundary).expect("initialize A");
         let transfer = transfer(3, owner(2));
         lease
-            .prepare(a, transfer, boundary)
+            .prepare(a, transfer, boundary, || {})
             .expect("prepare A to B");
-        assert!(lease.prepare(a, transfer, boundary).is_ok());
+        assert!(lease.prepare(a, transfer, boundary, || {}).is_ok());
         assert!(lease.verify_active(a, boundary).is_err());
         assert!(matches!(WriterLease::acquire(&path), Err(LimboError::Busy)));
         drop(lease);
@@ -654,7 +819,7 @@ mod tests {
             .is_err());
         assert!(retry.verify_active(a, boundary).is_err());
         assert!(retry.rollback(a, transfer, boundary).is_err());
-        assert!(retry.prepare(a, transfer, boundary).is_err());
+        assert!(retry.prepare(a, transfer, boundary, || {}).is_err());
     }
 
     #[test]
@@ -670,7 +835,7 @@ mod tests {
         assert!(lease.verify_active(a, boundary).is_ok());
         assert!(lease.accept(a, request, boundary).is_err());
         lease
-            .prepare(a, request, boundary)
+            .prepare(a, request, boundary, || {})
             .expect("publish over abandoned stage");
         assert!(!staging.exists());
         lease
@@ -679,15 +844,15 @@ mod tests {
         assert!(lease.rollback(a, request, boundary).is_ok());
         assert!(lease.verify_active(a, boundary).is_ok());
         assert!(lease.accept(a, request, boundary).is_err());
-        assert!(lease.prepare(a, request, boundary).is_err());
+        assert!(lease.prepare(a, request, boundary, || {}).is_err());
         let next = transfer(4, owner(2));
         lease
-            .prepare(a, next, boundary)
+            .prepare(a, next, boundary, || {})
             .expect("prepare a new transfer");
         lease
             .rollback(a, next, boundary)
             .expect("roll back a new transfer");
-        assert!(lease.prepare(a, request, boundary).is_err());
+        assert!(lease.prepare(a, request, boundary, || {}).is_err());
 
         let receipt = directory.path().join(&lease.receipt_name);
         std::fs::write(&receipt, b"malformed record").expect("damage fixture receipt");

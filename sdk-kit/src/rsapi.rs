@@ -1009,6 +1009,10 @@ impl TursoDatabase {
                             "database must be opened only once".to_string(),
                         ));
                     }
+                    turso_core::Database::check_handoff_open(
+                        &self.config.path,
+                        self.encrypted_overlap_reader,
+                    )?;
                     // keep lock for the whole method since open_async must be called only once and never will be called concurrently
 
                     let io: Arc<dyn turso_core::IO> = self.open_vfs_io()?;

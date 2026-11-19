@@ -449,6 +449,71 @@ async fn encrypted_write_boundary_preserves_live_reader() {
     );
 }
 
+/// Roll back a prepared successor while a separate reader keeps its snapshot.
+#[cfg(all(feature = "encrypted-wal-handoff", not(miri)))]
+#[tokio::test]
+async fn managed_encrypted_writer_rollback_preserves_separate_reader() {
+    use std::num::NonZeroU128;
+    use std::os::unix::fs::PermissionsExt;
+    use turso::encrypted_wal_handoff as handoff;
+
+    let directory = tempfile::tempdir().expect("fixture directory");
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+        .expect("private service directory");
+    let path = directory.path().join("overlap.db");
+    let writer = encrypted_builder(&path, false)
+        .experimental_encryption(true)
+        .experimental_multiprocess_wal(true)
+        .experimental_attach(false)
+        .experimental_vacuum(false)
+        .build()
+        .await
+        .expect("open encrypted writer");
+    let conn = writer.connect().expect("writer connection");
+    conn.execute("CREATE TABLE parent(value INTEGER)", ())
+        .await
+        .expect("schema");
+    conn.execute("INSERT INTO parent VALUES(31)", ())
+        .await
+        .expect("commit initial value");
+    let owner = handoff::WriterId(NonZeroU128::MIN);
+    handoff::enroll(&writer, owner).expect("enroll the native writer");
+
+    let mut reader = reader_process(directory.path(), "write-boundary")
+        .spawn()
+        .expect("start separate reader");
+    wait_for(&directory.path().join("boundary-reader-pinned"));
+    conn.execute("UPDATE parent SET value=32", ())
+        .await
+        .expect("commit final value");
+    let transfer = handoff::WriterTransfer {
+        id: handoff::TransferId(NonZeroU128::MIN),
+        successor: handoff::WriterId(NonZeroU128::new(2).expect("successor ID")),
+    };
+    let boundary = handoff::prepare(&writer, transfer).expect("prepare transfer");
+    assert!(boundary.committed_frames > 0);
+    fs::write(directory.path().join("boundary-mutations-locked"), b"").expect("signal prepared A");
+    wait_for(&directory.path().join("boundary-reader-checked"));
+    assert!(matches!(
+        conn.execute("UPDATE parent SET value=99", ()).await,
+        Err(Error::Busy(_))
+    ));
+    assert!(encrypted_builder(&path, false)
+        .experimental_encryption(true)
+        .experimental_multiprocess_wal(true)
+        .build()
+        .await
+        .is_err());
+    handoff::rollback(&writer, transfer).expect("restore predecessor ownership");
+    fs::write(directory.path().join("boundary-mutations-unlocked"), b"")
+        .expect("allow the reader to observe the final value");
+    assert!(reader.wait().expect("wait for reader").success());
+    conn.execute("UPDATE parent SET value=33", ())
+        .await
+        .expect("resume predecessor writes");
+    assert_eq!(integer(&conn, "SELECT value FROM parent").await, 33);
+}
+
 /// Refuse a different VFS or an initialized database without shared WAL coordination.
 #[tokio::test]
 async fn encrypted_overlap_refuses_fallback() {

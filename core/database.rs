@@ -62,6 +62,12 @@ use std::sync::OnceLock;
 use std::{fmt, ops::Deref};
 #[cfg(feature = "fs")]
 use storage::database::DatabaseFile;
+#[cfg(encrypted_wal_handoff)]
+use storage::encrypted_wal_handoff::{
+    self, ManagedWriter, PendingWriterTransfer, WriterClaim, WriterId, WriterLease, WriterTransfer,
+};
+#[cfg(encrypted_wal_handoff)]
+use storage::shared_wal_coordination::ManagedWalMode;
 #[cfg(host_shared_wal)]
 use storage::shared_wal_coordination::MappedSharedWalCoordination;
 use tracing::{instrument, Level};
@@ -656,6 +662,9 @@ pub struct Database<
     pub(crate) shared_wal: Arc<RwLock<WalFileShared>>,
     #[cfg(host_shared_wal)]
     shared_wal_coordination: OnceLock<Arc<MappedSharedWalCoordination>>,
+    /// Serializes control operations and retains the active writer lease.
+    #[cfg(encrypted_wal_handoff)]
+    managed_writer: Mutex<Option<ManagedWriter>>,
     init_lock: Arc<Mutex<()>>,
     pub(crate) open_flags: OpenFlags,
     // Use parking lot RwLock here and not `crate::sync::RwLock` because it relies on `data_ptr` and that is experimental
@@ -820,6 +829,8 @@ impl Database {
             shared_wal,
             #[cfg(host_shared_wal)]
             shared_wal_coordination: OnceLock::new(),
+            #[cfg(encrypted_wal_handoff)]
+            managed_writer: Mutex::new(None),
             db_file,
             builtin_syms: parking_lot::RwLock::new(syms),
             dialect,
@@ -1285,6 +1296,7 @@ impl Database {
         // the custom wal_path before open_async runs its own check.
         Self::reject_wal_path_for_registry_open(&options)?;
         Self::validate_open_options(&options)?;
+        Self::check_handoff_open(path, options.db_opts.encrypted_overlap_reader)?;
         if options.storage.is_none() {
             if let Some(db) = Self::resolve_default_storage(&io, path, &mut options, true)? {
                 return Ok(db);
@@ -1324,6 +1336,9 @@ impl Database {
     ) -> IOResultOr<Arc<Database>> {
         Self::reject_wal_path_for_registry_open(options)?;
         Self::validate_open_options(options)?;
+        if matches!(state.phase, OpenDbAsyncPhase::Init) {
+            Self::check_handoff_open(path, options.db_opts.encrypted_overlap_reader)?;
+        }
         let Some(storage) = options.storage.clone() else {
             return Err(LimboError::InvalidArgument(
                 "OpenOptions::storage is required for Database::open_async".to_string(),
@@ -1435,6 +1450,7 @@ impl Database {
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn do_open(io: Arc<dyn IO>, path: &str, mut options: OpenOptions) -> Result<Arc<Database>> {
         Self::validate_open_options(&options)?;
+        Self::check_handoff_open(path, options.db_opts.encrypted_overlap_reader)?;
         if options.storage.is_none() {
             // `use_registry = false`: the raw path never consults the registry,
             // so this only opens the file and never returns a cached Database.
@@ -1463,6 +1479,9 @@ impl Database {
         options: &OpenOptions,
     ) -> IOResultOr<Arc<Database>> {
         Self::validate_open_options(options)?;
+        if matches!(state.phase, OpenDbAsyncPhase::Init) {
+            Self::check_handoff_open(path, options.db_opts.encrypted_overlap_reader)?;
+        }
         let Some(storage) = options.storage.clone() else {
             return Err(LimboError::InvalidArgument(
                 "OpenOptions::storage is required for Database::do_open_async".to_string(),
@@ -2401,7 +2420,7 @@ impl Database {
     /// Rebuild the process-local shared WAL view after a caller restores the
     /// database and WAL files outside the pager.
     pub fn reload_wal_after_external_restore(self: &Arc<Self>) -> Result<()> {
-        if self.is_encrypted_overlap_reader() {
+        if self.is_encrypted_overlap_reader() || self.is_managed_wal_writer() {
             return Err(LimboError::ReadOnly);
         }
         if self.page_codec_id.is_some() {
@@ -3127,73 +3146,164 @@ impl Database {
         })
     }
 
-    /// Sync a committed encrypted WAL boundary and pass it to a transition operation.
-    ///
-    /// The existing writer and checkpoint locks remain held for the whole callback.
-    /// The caller must stop admission of new writes before entering and avoid
-    /// reentering database operations from the callback. An active writer,
-    /// incomplete publication, or unreconciled WAL returns `Busy`. Only native
-    /// AES-256-GCM shared-WAL writers on 64-bit Linux support this operation.
+    /// Refuse an ordinary open of a managed backing before any writable VFS open.
+    /// Strict overlap opens supply the existing read-only attachment profile.
+    pub fn check_handoff_open(_path: &str, _strict_overlap: bool) -> Result<()> {
+        #[cfg(encrypted_wal_handoff)]
+        if !_strict_overlap && !is_memory_like(_path) {
+            encrypted_wal_handoff::reject_unmanaged_open(_path)?;
+        }
+        Ok(())
+    }
+
+    /// Whether raw mutation and shutdown maintenance are disabled for this writer.
+    pub(crate) fn is_managed_wal_writer(&self) -> bool {
+        #[cfg(encrypted_wal_handoff)]
+        return self
+            .shared_wal_coordination
+            .get()
+            .is_some_and(|mapping| mapping.managed());
+        #[cfg(not(encrypted_wal_handoff))]
+        false
+    }
+
+    /// Enroll an existing authenticated writer before attaching a successor.
+    /// The controller must quiesce existing operations and exclude unmanaged
+    /// writers. Only the synchronous Linux VFS and an existing local WAL are
+    /// supported. Raw write APIs, ATTACH, and in-place VACUUM are outside this profile.
+    #[cfg(encrypted_wal_handoff)]
+    pub fn enroll_encrypted_wal_writer(&self, owner: WriterId) -> Result<WriterClaim> {
+        if !self.io.supports_encrypted_wal_handoff()
+            || self.opts.enable_attach
+            || self.opts.enable_vacuum
+        {
+            return Err(LimboError::InvalidArgument(
+                "managed encrypted WAL requires native synchronous I/O with ATTACH and VACUUM disabled".into(),
+            ));
+        }
+        let authority = self.encrypted_writer_authority()?;
+        let mut state = self.managed_writer.lock();
+        if state.is_some() {
+            return Err(LimboError::Conflict(
+                "encrypted WAL writer already enrolled".into(),
+            ));
+        }
+        let mut lease = WriterLease::acquire(Path::new(&self.path))?;
+        authority.with_handoff_locks(|| {
+            let boundary = self.encrypted_boundary_under_locks(authority, true)?;
+            authority.set_managed_mode(ManagedWalMode::Fenced);
+            let claim = lease.initialize(owner, boundary)?;
+            *state = Some(ManagedWriter {
+                claim,
+                lease: Some(lease),
+                pending: None,
+                last_rollback: None,
+            });
+            authority.set_managed_mode(ManagedWalMode::Active);
+            Ok(claim)
+        })
+    }
+
+    /// Durably prepare a successor and stop admitting SQL writes and checkpoints.
+    /// In-flight mutations cause `Busy` before the fence changes. An uncertain
+    /// receipt publication keeps the predecessor fenced with its lease retained.
+    #[cfg(encrypted_wal_handoff)]
+    pub fn prepare_encrypted_wal_handoff(
+        &self,
+        request: WriterTransfer,
+    ) -> Result<EncryptedWalWriteBoundary> {
+        let authority = self.encrypted_writer_authority()?;
+        let mut state = self.managed_writer.lock();
+        let writer = state
+            .as_mut()
+            .ok_or_else(|| LimboError::Conflict("encrypted WAL writer is not enrolled".into()))?;
+        if let Some(pending) = &writer.pending {
+            if pending.request != request {
+                return Err(LimboError::Conflict(
+                    "another encrypted WAL transfer is prepared".into(),
+                ));
+            }
+            if writer.lease.is_none() {
+                return Ok(pending.boundary);
+            }
+        }
+        authority
+            .with_handoff_locks(|| {
+                let boundary = self.encrypted_boundary_under_locks(authority, true)?;
+                let lease = writer.lease.as_mut().ok_or(LimboError::Busy)?;
+                lease.prepare(writer.claim, request, boundary, || {
+                    writer.pending = Some(PendingWriterTransfer { request, boundary });
+                    writer.last_rollback = None;
+                    authority.set_managed_mode(ManagedWalMode::Fenced);
+                })?;
+                Ok(boundary)
+            })
+            .map(|boundary| {
+                writer.lease = None;
+                boundary
+            })
+    }
+
+    /// Restore the enrolled predecessor if the successor never accepted.
+    /// A stale or ambiguous receipt leaves SQL admission fenced.
+    #[cfg(encrypted_wal_handoff)]
+    pub fn rollback_encrypted_wal_handoff(&self, request: WriterTransfer) -> Result<()> {
+        let authority = self.encrypted_writer_authority()?;
+        let mut state = self.managed_writer.lock();
+        let writer = state
+            .as_mut()
+            .ok_or_else(|| LimboError::Conflict("encrypted WAL writer is not enrolled".into()))?;
+        let prepared = match writer.pending.as_ref() {
+            Some(pending) if pending.request == request => pending.boundary,
+            None if writer.last_rollback == Some(request) => return Ok(()),
+            _ => {
+                return Err(LimboError::Conflict(
+                    "encrypted WAL transfer is not pending".into(),
+                ))
+            }
+        };
+        let acquired_lease = writer.lease.is_none();
+        if acquired_lease {
+            writer.lease = Some(WriterLease::acquire(Path::new(&self.path))?);
+        }
+        let result = authority.with_handoff_locks(|| {
+            let boundary = self.encrypted_boundary_under_locks(authority, false)?;
+            if boundary != prepared {
+                return Err(LimboError::Conflict(
+                    "encrypted WAL changed after handoff preparation".into(),
+                ));
+            }
+            let lease = writer.lease.as_mut().ok_or(LimboError::Busy)?;
+            lease.rollback(writer.claim, request, boundary)?;
+            writer.pending = None;
+            writer.last_rollback = Some(request);
+            authority.set_managed_mode(ManagedWalMode::Active);
+            Ok(())
+        });
+        if result.is_err() && acquired_lease {
+            writer.lease = None;
+        }
+        result
+    }
+
+    /// Sync a committed unmanaged encrypted WAL boundary for a control operation.
+    /// The callback runs under both physical mutation locks and must avoid
+    /// database re-entry. Managed writers use the durable receipt API.
     pub fn with_encrypted_wal_write_boundary<T>(
         &self,
         action: impl FnOnce(EncryptedWalWriteBoundary) -> T,
     ) -> Result<T> {
         #[cfg(all(host_shared_wal, target_os = "linux", feature = "encryption"))]
         {
-            use crate::io::FileSyncType;
-            if self.is_readonly() || self.encryption_cipher_mode.get() != CipherMode::Aes256Gcm {
-                return Err(LimboError::InvalidArgument(
-                    "a write boundary requires an AES-256-GCM shared WAL writer".into(),
-                ));
-            }
-            let authority = self.shared_wal_coordination.get().ok_or_else(|| {
-                LimboError::InvalidArgument("the database has no initialized shared WAL".into())
-            })?;
+            let authority = self.encrypted_writer_authority()?;
             authority.with_handoff_locks(|| {
-                if !self.initialized() || self.db_file.size()? == 0 {
-                    return Err(LimboError::InvalidArgument(
-                        "encrypted handoff requires a persisted database page one".into(),
+                if self.is_managed_wal_writer() {
+                    return Err(LimboError::Conflict(
+                        "managed WAL requires a receipt operation".into(),
                     ));
                 }
-                let snapshot = authority.try_snapshot().ok_or(LimboError::Busy)?;
-                if authority.frame_index_overflowed() {
-                    return Err(LimboError::Busy);
-                }
-                let database = self.db_file.opened_file_id()?;
-                let coordinator = authority.opened_file_id()?;
-                let wal_file = self
-                    .shared_wal
-                    .read()
-                    .runtime
-                    .file
-                    .clone()
-                    .ok_or(LimboError::Busy)?;
-                let wal = WalFileShared::sync_handoff_boundary(&self.io, &wal_file, snapshot)?;
-                self.io.wait_for_completion(
-                    self.db_file
-                        .sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)?,
-                )?;
-                self.io
-                    .wait_for_completion(authority.begin_sync(FileSyncType::Fsync)?)?;
-                let coordinator_path = storage::wal::coordination_path_for_wal_path(&self.wal_path);
-                if self.io.file_id(&self.path)? != database
-                    || self.io.file_id(&self.wal_path)? != wal
-                    || self.io.file_id(&coordinator_path)? != coordinator
-                {
-                    return Err(LimboError::InvalidArgument(
-                        "database, WAL, or coordinator path no longer names the opened file".into(),
-                    ));
-                }
-                if authority.try_snapshot() != Some(snapshot) {
-                    return Err(LimboError::Busy);
-                }
-                Ok(action(EncryptedWalWriteBoundary {
-                    database,
-                    wal,
-                    coordinator,
-                    committed_frames: snapshot.max_frame,
-                    wal_position: snapshot.encode(),
-                }))
+                self.encrypted_boundary_under_locks(authority, true)
+                    .map(action)
             })
         }
         #[cfg(not(all(host_shared_wal, target_os = "linux", feature = "encryption")))]
@@ -3203,6 +3313,82 @@ impl Database {
                 "encrypted WAL write boundaries require 64-bit Linux with shared WAL".into(),
             ))
         }
+    }
+
+    /// Require the already-open native AES-256-GCM writer coordinator.
+    #[cfg(all(host_shared_wal, target_os = "linux", feature = "encryption"))]
+    fn encrypted_writer_authority(&self) -> Result<&MappedSharedWalCoordination> {
+        if self.is_readonly() || self.encryption_cipher_mode.get() != CipherMode::Aes256Gcm {
+            return Err(LimboError::InvalidArgument(
+                "a write boundary requires an AES-256-GCM shared WAL writer".into(),
+            ));
+        }
+        self.shared_wal_coordination
+            .get()
+            .map(Arc::as_ref)
+            .ok_or_else(|| {
+                LimboError::InvalidArgument("the database has no initialized shared WAL".into())
+            })
+    }
+
+    /// Read the exact committed position from the current open file handles.
+    /// The caller holds the writer and checkpoint locks throughout validation.
+    #[cfg(all(host_shared_wal, target_os = "linux", feature = "encryption"))]
+    fn encrypted_boundary_under_locks(
+        &self,
+        authority: &MappedSharedWalCoordination,
+        sync: bool,
+    ) -> Result<EncryptedWalWriteBoundary> {
+        use crate::io::FileSyncType;
+        if !self.initialized() || self.db_file.size()? == 0 {
+            return Err(LimboError::InvalidArgument(
+                "encrypted handoff requires a persisted database page one".into(),
+            ));
+        }
+        let snapshot = authority.try_snapshot().ok_or(LimboError::Busy)?;
+        if authority.frame_index_overflowed() {
+            return Err(LimboError::Busy);
+        }
+        let database = self.db_file.opened_file_id()?;
+        let coordinator = authority.opened_file_id()?;
+        let wal_file = self
+            .shared_wal
+            .read()
+            .runtime
+            .file
+            .clone()
+            .ok_or(LimboError::Busy)?;
+        let wal = if sync {
+            let wal = WalFileShared::sync_handoff_boundary(&self.io, &wal_file, snapshot)?;
+            self.io.wait_for_completion(
+                self.db_file
+                    .sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)?,
+            )?;
+            self.io
+                .wait_for_completion(authority.begin_sync(FileSyncType::Fsync)?)?;
+            wal
+        } else {
+            WalFileShared::verify_handoff_boundary(&self.io, &wal_file, snapshot)?
+        };
+        let coordinator_path = storage::wal::coordination_path_for_wal_path(&self.wal_path);
+        if self.io.file_id(&self.path)? != database
+            || self.io.file_id(&self.wal_path)? != wal
+            || self.io.file_id(&coordinator_path)? != coordinator
+        {
+            return Err(LimboError::InvalidArgument(
+                "database, WAL, or coordinator path no longer names the opened file".into(),
+            ));
+        }
+        if authority.try_snapshot() != Some(snapshot) {
+            return Err(LimboError::Busy);
+        }
+        Ok(EncryptedWalWriteBoundary {
+            database,
+            wal,
+            coordinator,
+            committed_frames: snapshot.max_frame,
+            wal_position: snapshot.encode(),
+        })
     }
 
     #[cfg(feature = "simulator")]
