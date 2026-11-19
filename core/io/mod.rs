@@ -66,7 +66,7 @@ mod completions;
 pub use clock::Clock;
 pub use completions::*;
 #[cfg(encrypted_wal_handoff)]
-pub(crate) use unix::unix_shared_wal_lock_byte;
+pub(crate) use unix::{handoff_file, unix_shared_wal_lock_byte};
 
 /// Platform-independent file identity, analogous to SQLite's `struct unixFileId`.
 /// On Unix: (st_dev, st_ino). On Windows: (dwVolumeSerialNumber, nFileIndex).

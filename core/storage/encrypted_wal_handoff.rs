@@ -63,6 +63,21 @@ pub(crate) struct ManagedWriter {
     pub(crate) pending: Option<PendingWriterTransfer>,
     /// Latest confirmed rollback, for a retry at this open writer.
     pub(crate) last_rollback: Option<WriterTransfer>,
+    /// The exact activation that created this live writable incarnation.
+    pub(crate) activation: Option<WriterActivation>,
+}
+
+/// Identifies an activation retry within the lifetime of the accepted writer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WriterActivation {
+    pub(crate) previous: WriterClaim,
+    pub(crate) transfer: WriterTransfer,
+}
+
+/// No-create writable descriptors for the same files authenticated by the reader.
+pub(crate) struct WritableWalBacking {
+    pub(crate) database: File,
+    pub(crate) wal: File,
 }
 
 /// Exact pending operation retained for retry and rollback in the predecessor.
@@ -300,24 +315,10 @@ impl WriterLease {
         boundary: EncryptedWalWriteBoundary,
     ) -> Result<WriterClaim> {
         let mut record = self.verified_receipt(boundary)?;
-        let claim = WriterClaim {
-            owner: transfer.successor,
-            epoch: previous
-                .epoch
-                .checked_add(1)
-                .ok_or(LimboError::IntegerOverflow)?,
-        };
-        let result = ResolvedTransfer {
-            request: transfer,
-            predecessor: previous.owner,
-            outcome: TransferOutcome::Accepted,
-        };
+        let (claim, result) = record.require_activation(previous, transfer, boundary)?;
         if record.claim == claim && record.resolved == Some(result) && record.prepared.is_none() {
             self.sync_directory()?;
             return Ok(claim);
-        }
-        if !record.matches_prepared(previous, transfer, boundary.wal_position) {
-            return Err(stale_writer());
         }
         record.claim = claim;
         record.resolved = Some(result);
@@ -367,6 +368,7 @@ impl WriterLease {
 
     /// Confirm an active claim after recovering and validating its actual WAL.
     /// Re-sync the directory before relying on a receipt left by a crash.
+    #[cfg(test)]
     pub(crate) fn verify_active(
         &self,
         claim: WriterClaim,
@@ -392,6 +394,39 @@ impl WriterLease {
             return Err(stale_writer());
         }
         Ok(())
+    }
+
+    /// Reopen the original backing writable once a prepared or exactly accepted
+    /// receipt identifies the caller. Both mutation bytes must be held.
+    pub(crate) fn open_for_activation(
+        &self,
+        activation: WriterActivation,
+        boundary: EncryptedWalWriteBoundary,
+    ) -> Result<WritableWalBacking> {
+        let record = self.verified_receipt(boundary)?;
+        record.require_activation(activation.previous, activation.transfer, boundary)?;
+        Ok(WritableWalBacking {
+            database: self.open_matching_backing(&self.backing_names[0], boundary.database)?,
+            wal: self.open_matching_backing(&self.backing_names[1], boundary.wal)?,
+        })
+    }
+
+    /// Check the descriptor returned by openat, independently of its pathname.
+    fn open_matching_backing(&self, name: &OsString, identity: FileId) -> Result<File> {
+        let file = open_file(&self.directory, name, OFlags::RDWR)
+            .map_err(|err| io_error(err, "open writable WAL backing"))?;
+        let stat = file
+            .metadata()
+            .map_err(|err| io_error(err, "stat writable WAL backing"))?;
+        if !stat.is_file()
+            || stat.uid() != effective_uid()
+            || stat.nlink() != 1
+            || stat.dev() != identity.dev
+            || stat.ino() != identity.ino
+        {
+            return Err(invalid_backing());
+        }
+        Ok(file)
     }
 
     /// Bind the receipt to current path identities and the actual open handles
@@ -497,6 +532,32 @@ impl WriterLease {
 }
 
 impl Receipt {
+    /// Resolve an exact prepared request or its prior durable acceptance.
+    fn require_activation(
+        &self,
+        previous: WriterClaim,
+        transfer: WriterTransfer,
+        boundary: EncryptedWalWriteBoundary,
+    ) -> Result<(WriterClaim, ResolvedTransfer)> {
+        let claim = WriterClaim {
+            owner: transfer.successor,
+            epoch: previous
+                .epoch
+                .checked_add(1)
+                .ok_or(LimboError::IntegerOverflow)?,
+        };
+        let resolved = ResolvedTransfer {
+            request: transfer,
+            predecessor: previous.owner,
+            outcome: TransferOutcome::Accepted,
+        };
+        let accepted =
+            self.claim == claim && self.resolved == Some(resolved) && self.prepared.is_none();
+        if !accepted && !self.matches_prepared(previous, transfer, boundary.wal_position) {
+            return Err(stale_writer());
+        }
+        Ok((claim, resolved))
+    }
     /// Match the exact predecessor, nominated successor, request ID, and WAL position.
     fn matches_prepared(
         &self,

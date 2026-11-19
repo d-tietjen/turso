@@ -93,6 +93,15 @@ pub struct UnixFile {
     path: String,
 }
 
+/// Use a descriptor already opened and verified by the native handoff lease.
+#[cfg(encrypted_wal_handoff)]
+pub(crate) fn handoff_file(file: std::fs::File, path: &str) -> Arc<dyn File> {
+    Arc::new(UnixFile {
+        file,
+        path: path.to_owned(),
+    })
+}
+
 pub(crate) struct UnixSharedWalMapping {
     mapping_ptr: NonNull<u8>,
     mapping_len: usize,
