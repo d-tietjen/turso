@@ -5989,6 +5989,31 @@ impl WalFileShared {
         Ok(())
     }
 
+    /// Adopt the writable handle for a verified native WAL without reopening it.
+    /// The caller must verify the physical WAL and its mapped snapshot while
+    /// holding both mutation locks. The shared frame index stays in the mapping.
+    #[cfg(encrypted_wal_handoff)]
+    pub(crate) fn from_verified_handoff(
+        file: Arc<dyn crate::io::File>,
+        boundary: &crate::EncryptedWalWriteBoundary,
+    ) -> Result<Arc<RwLock<WalFileShared>>> {
+        if file.opened_file_id()? != boundary.wal {
+            return Err(LimboError::InvalidArgument(
+                "handoff WAL handle differs from the verified WAL".into(),
+            ));
+        }
+        let snapshot = SharedWalCoordinationHeader::decode(&boundary.wal_position)?;
+        if snapshot.max_frame != boundary.committed_frames
+            || snapshot.nbackfills > snapshot.max_frame
+        {
+            return Err(LimboError::Corrupt(
+                "invalid committed WAL position in handoff boundary".into(),
+            ));
+        }
+        let wal_size = file.size()?;
+        Ok(Self::from_authority_snapshot(file, snapshot, wal_size))
+    }
+
     #[cfg(host_shared_wal)]
     pub(crate) fn open_shared_from_authority_if_exists(
         io: &Arc<dyn IO>,
@@ -6104,6 +6129,16 @@ impl WalFileShared {
         {
             return Err(LimboError::Busy);
         }
+        Ok(Self::from_authority_snapshot(file, snapshot, wal_size))
+    }
+
+    /// Build the local WAL state for an already-validated snapshot and open file.
+    #[cfg(host_shared_wal)]
+    fn from_authority_snapshot(
+        file: Arc<dyn crate::io::File>,
+        snapshot: SharedWalCoordinationHeader,
+        wal_size: u64,
+    ) -> Arc<RwLock<WalFileShared>> {
         let wal_is_initialized = wal_size >= WAL_HEADER_SIZE as u64;
 
         let wal_header = WalHeader {
@@ -6149,7 +6184,7 @@ impl WalFileShared {
                 )),
             },
         };
-        Ok(Arc::new(RwLock::new(shared)))
+        Arc::new(RwLock::new(shared))
     }
 
     pub fn open_shared_if_exists(
@@ -8795,6 +8830,59 @@ pub mod test {
             .loaded_from_disk_scan
             .load(Ordering::Acquire));
         assert!(shared.runtime.frame_cache.lock().is_empty());
+    }
+
+    #[cfg(encrypted_wal_handoff)]
+    #[test]
+    fn test_verified_handoff_adopts_open_wal_and_committed_checksum() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test.db-wal");
+        let shm_path = dir.path().join("test.db-tshm");
+        let io = shared_wal_test_io();
+        let snapshot = write_test_wal_with_single_commit_frame(&io, &wal_path);
+        let authority = MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap();
+        authority.install_snapshot(snapshot);
+        authority.record_frame(7, 1);
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::NoLock, false)
+            .unwrap();
+        let (shared, boundary) = authority
+            .with_handoff_locks(|| {
+                let snapshot = authority.try_snapshot().ok_or(LimboError::Busy)?;
+                let boundary = crate::EncryptedWalWriteBoundary {
+                    database: open_test_db_file_for_wal(&io, &wal_path).opened_file_id()?,
+                    wal: WalFileShared::verify_handoff_boundary(&io, &file, snapshot)?,
+                    coordinator: authority.opened_file_id()?,
+                    committed_frames: snapshot.max_frame,
+                    wal_position: snapshot.encode(),
+                };
+                let shared = WalFileShared::from_verified_handoff(file.clone(), &boundary)?;
+                Ok((shared, boundary))
+            })
+            .unwrap();
+        let shared = shared.read();
+        assert!(Arc::ptr_eq(shared.runtime.file.as_ref().unwrap(), &file));
+        assert_eq!(
+            shared.last_checksum_and_max_frame(),
+            (
+                (snapshot.checksum_1, snapshot.checksum_2),
+                snapshot.max_frame
+            )
+        );
+        assert!(shared.metadata.initialized.load(Ordering::Acquire));
+        assert!(!shared
+            .metadata
+            .loaded_from_disk_scan
+            .load(Ordering::Acquire));
+
+        let wrong_file = crate::EncryptedWalWriteBoundary {
+            wal: boundary.database,
+            ..boundary
+        };
+        assert!(matches!(
+            WalFileShared::from_verified_handoff(file, &wrong_file),
+            Err(LimboError::InvalidArgument(_))
+        ));
     }
 
     #[cfg(host_shared_wal)]
