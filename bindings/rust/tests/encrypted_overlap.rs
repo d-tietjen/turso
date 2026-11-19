@@ -665,6 +665,10 @@ async fn run_managed_activation_successor(dir: &Path, db: &turso::Database, read
     drop(writer);
     assert_reader_descriptors(dir);
     assert_eq!(integer(reader, "SELECT value FROM parent").await, 31);
+    assert!(encrypted_builder(&dir.join("overlap.db"), false)
+        .build_encrypted_overlap_reader()
+        .await
+        .is_err());
 
     let writer =
         handoff::activate(db, reader, previous, request).expect("reopen accepted successor");
@@ -681,6 +685,16 @@ async fn run_managed_activation_successor(dir: &Path, db: &turso::Database, read
         reader.execute("UPDATE parent SET value=99", ()).await,
         Err(Error::Readonly(_))
     ));
+    assert_eq!(
+        integer(&writer_conn, "PRAGMA wal_checkpoint(TRUNCATE)").await,
+        0
+    );
+    assert_eq!(
+        fs::metadata(dir.join("overlap.db-wal"))
+            .expect("retained WAL")
+            .len(),
+        0
+    );
     assert_activated_descriptors(dir, boundary);
     fs::write(dir.join("activation-successor-committed"), b"").expect("signal successor commit");
     wait_for(&dir.join("activation-predecessor-checked"));

@@ -609,6 +609,13 @@ pub(crate) enum RegistryEntry {
     Opening,
     /// The database has been opened and is (or was) live.
     Ready(Weak<Database>),
+    /// Each incarnation uses the same retained mapping. Keep the attached
+    /// reader reserved while an accepted writer can be reopened on retry.
+    #[cfg(encrypted_wal_handoff)]
+    Handoff {
+        reader: Weak<Database>,
+        writer: Weak<Database>,
+    },
 }
 
 /// The database manager ensures that there is a single, shared
@@ -1408,6 +1415,16 @@ impl Database {
                             io::Completion::new_yield(),
                         )));
                     }
+                    #[cfg(encrypted_wal_handoff)]
+                    Some(RegistryEntry::Handoff { reader, writer }) => {
+                        if reader.upgrade().is_some() || writer.upgrade().is_some() {
+                            return Err(LimboError::Conflict(
+                                "handoff database is already open in this process".into(),
+                            )
+                            .into());
+                        }
+                        registry.insert(key.clone(), RegistryEntry::Opening);
+                    }
                     None => {
                         // Not in registry — mark as Opening and proceed.
                         registry.insert(key.clone(), RegistryEntry::Opening);
@@ -1577,6 +1594,10 @@ impl Database {
         allocators: DatabaseAllocators,
         dialect: Arc<dyn Dialect>,
     ) -> IOResultOr<Arc<Database>> {
+        #[cfg(encrypted_wal_handoff)]
+        let handoff = state.handoff_bootstrap.is_some();
+        #[cfg(not(encrypted_wal_handoff))]
+        let handoff = false;
         loop {
             tracing::debug!("do_open_async_internal: state.phase={:?}", state.phase);
             match &state.phase {
@@ -1608,7 +1629,6 @@ impl Database {
                     db.durable_storage.clone_from(&durable_storage);
                     #[cfg(encrypted_wal_handoff)]
                     if let Some(handoff) = state.handoff_bootstrap.as_ref() {
-                        db.shared_wal = handoff.wal.clone();
                         db.shared_wal_coordination
                             .set(handoff.authority.clone())
                             .map_err(|_| {
@@ -1630,9 +1650,12 @@ impl Database {
 
                 OpenDbAsyncPhase::ValidatingHeader => {
                     #[cfg(encrypted_wal_handoff)]
-                    let handoff = state.handoff_bootstrap.is_some();
+                    let handoff_wal = state
+                        .handoff_bootstrap
+                        .as_ref()
+                        .map(|bootstrap| &bootstrap.wal);
                     #[cfg(not(encrypted_wal_handoff))]
-                    let handoff = false;
+                    let handoff_wal = None;
                     let db = state
                         .building_db
                         .as_mut()
@@ -1642,7 +1665,7 @@ impl Database {
                         &mut hv_state,
                         state.encryption_key.as_ref(),
                         page_codec.as_ref(),
-                        handoff,
+                        handoff_wal,
                     );
                     state.header_validation_state = hv_state;
                     let pager = return_if_io!(result);
@@ -1755,7 +1778,7 @@ impl Database {
                             // Release the schema lock
                             state.schema_guard = None;
                         }
-                        Err(err) if matches!(*err, LimboError::ExtensionError(_)) => {
+                        Err(err) if !handoff && matches!(*err, LimboError::ExtensionError(_)) => {
                             let LimboError::ExtensionError(e) = *err else {
                                 unreachable!()
                             };
@@ -1795,6 +1818,9 @@ impl Database {
                             Ok(())
                         })();
                         if let Err(e) = load_result {
+                            if handoff {
+                                return Err(e.into());
+                            }
                             tracing::warn!("Failed to load custom types during open: {}", e);
                         }
                     }
@@ -2020,8 +2046,9 @@ impl Database {
         st: &mut HeaderValidationState,
         encryption_key: Option<&EncryptionKey>,
         page_codec: Option<&Arc<dyn PageCodec>>,
-        handoff: bool,
+        handoff_wal: Option<&Arc<RwLock<WalFileShared>>>,
     ) -> IOResultOr<Arc<Pager>> {
+        let handoff = handoff_wal.is_some();
         loop {
             match st {
                 HeaderValidationState::Start { init } => {
@@ -2294,8 +2321,8 @@ impl Database {
                 } => {
                     // Always open shared WAL and set it in the Database and Pager.
                     // MVCC currently requires a WAL open to function.
-                    let mut shared_wal = if handoff {
-                        self.shared_wal.clone()
+                    let mut shared_wal = if let Some(verified) = handoff_wal {
+                        verified.clone()
                     } else {
                         #[cfg(not(host_shared_wal))]
                         {
@@ -3421,7 +3448,13 @@ impl Database {
         })?;
         let writer =
             self.bootstrap_handoff_writer(backing, &boundary, authority.clone(), encryption)?;
-        if !std::ptr::eq(self, Self::registered_handoff_database(&key)?.as_ref()) {
+        if writer.is_readonly() {
+            return Err(LimboError::ReadOnly);
+        }
+        if !std::ptr::eq(
+            self,
+            Self::registered_handoff_receiver(&key, &reader.db)?.as_ref(),
+        ) {
             return Err(LimboError::Conflict(
                 "handoff reader changed while opening the successor".into(),
             ));
@@ -3435,9 +3468,14 @@ impl Database {
             }
             let claim = lease.accept(previous, transfer, verified)?;
             let mut registry = DATABASE_MANAGER.lock();
-            if !matches!(registry.get(&key), Some(RegistryEntry::Ready(registered))
-                if std::ptr::eq(registered.as_ptr(), self))
-            {
+            let still_reserved = match registry.get(&key) {
+                Some(RegistryEntry::Ready(registered)) => std::ptr::eq(registered.as_ptr(), self),
+                Some(RegistryEntry::Handoff { reader, writer }) => {
+                    std::ptr::eq(reader.as_ptr(), self) && writer.upgrade().is_none()
+                }
+                _ => false,
+            };
+            if !still_reserved {
                 return Err(LimboError::Conflict(
                     "handoff registry changed before writer publication".into(),
                 ));
@@ -3450,35 +3488,30 @@ impl Database {
                 activation: Some(activation),
             });
             authority.set_managed_mode(ManagedWalMode::Active);
-            registry.insert(key, RegistryEntry::Ready(Arc::downgrade(&writer)));
+            registry.insert(
+                key,
+                RegistryEntry::Handoff {
+                    reader: Arc::downgrade(&reader.db),
+                    writer: Arc::downgrade(&writer),
+                },
+            );
             Ok(())
         })?;
         Ok(writer)
     }
 
-    /// Restore the still-open reader's entry if a prior accepted writer was
-    /// dropped before its caller could consume the response. Receipt and lease
-    /// validation will still precede any return of writer custody.
+    /// Find the original reader or its accepted writer. Keep the original
+    /// reader reserved for exact retries even after the writer closes.
     #[cfg(encrypted_wal_handoff)]
     fn registered_handoff_receiver(key: &DatabaseKey, reader: &Arc<Self>) -> Result<Arc<Self>> {
-        let mut registry = DATABASE_MANAGER.lock();
-        match registry.get(key) {
-            Some(RegistryEntry::Ready(entry)) => {
-                if let Some(database) = entry.upgrade() {
-                    return Ok(database);
-                }
-            }
-            _ => return Err(LimboError::Busy),
-        }
-        registry.insert(key.clone(), RegistryEntry::Ready(Arc::downgrade(reader)));
-        Ok(reader.clone())
-    }
-
-    /// Fetch the live instance without holding the registry across I/O.
-    #[cfg(encrypted_wal_handoff)]
-    fn registered_handoff_database(key: &DatabaseKey) -> Result<Arc<Self>> {
         match DATABASE_MANAGER.lock().get(key) {
             Some(RegistryEntry::Ready(registered)) => registered.upgrade().ok_or(LimboError::Busy),
+            Some(RegistryEntry::Handoff {
+                reader: source,
+                writer,
+            }) if std::ptr::eq(source.as_ptr(), reader.as_ref()) => {
+                Ok(writer.upgrade().unwrap_or_else(|| reader.clone()))
+            }
             _ => Err(LimboError::Busy),
         }
     }
