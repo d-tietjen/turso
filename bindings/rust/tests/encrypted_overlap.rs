@@ -760,6 +760,254 @@ async fn managed_encrypted_writer_activates_separate_successor() {
     assert!(successor.wait().expect("reap successor").success());
 }
 
+/// Own the crash fixture's predecessor even when an assertion fails before the planned kill.
+#[cfg(all(feature = "encrypted-wal-handoff", not(miri)))]
+struct CrashPredecessor(std::process::Child);
+
+#[cfg(all(feature = "encrypted-wal-handoff", not(miri)))]
+impl CrashPredecessor {
+    /// Start the child test from this ELF or a separately compiled writer ELF.
+    fn spawn(directory: &Path, prepare: bool) -> Self {
+        let executable = std::env::var_os("TURSO_ENCRYPTED_OVERLAP_WRITER_BINARY")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::env::current_exe().expect("test executable"));
+        let child = Command::new(executable)
+            .args([
+                "--exact",
+                "encrypted_overlap_predecessor_process",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("TURSO_ENCRYPTED_OVERLAP_FIXTURE", directory)
+            .env(
+                "TURSO_ENCRYPTED_OVERLAP_PREDECESSOR_OUTCOME",
+                if prepare { "prepared" } else { "unprepared" },
+            )
+            .spawn()
+            .expect("start predecessor process");
+        Self(child)
+    }
+
+    /// Kill the live predecessor and confirm it exited by signal before continuing.
+    fn kill_and_reap(&mut self) {
+        use std::os::unix::process::ExitStatusExt;
+
+        assert!(self.0.try_wait().expect("poll predecessor").is_none());
+        self.0.kill().expect("kill live predecessor");
+        assert_eq!(self.0.wait().expect("reap predecessor").signal(), Some(9));
+    }
+}
+
+#[cfg(all(feature = "encrypted-wal-handoff", not(miri)))]
+impl Drop for CrashPredecessor {
+    fn drop(&mut self) {
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+/// Check both the non-idempotent effect and the unique receipt in the current SQL snapshot.
+#[cfg(all(feature = "encrypted-wal-handoff", not(miri)))]
+async fn assert_crash_operation(conn: &Connection, visible: bool) {
+    let expected_rows = if visible { 1 } else { 0 };
+    assert_eq!(
+        integer(conn, "SELECT total FROM counter WHERE id=1").await,
+        7 * expected_rows
+    );
+    assert_eq!(
+        integer(conn, "SELECT count(*) FROM operations").await,
+        expected_rows
+    );
+    assert_eq!(
+        integer(
+            conn,
+            "SELECT count(*) FROM operations WHERE operation_id='increment-0001' AND delta=7"
+        )
+        .await,
+        expected_rows
+    );
+}
+
+/// Run A in a separate process, with application acknowledgement held past the crash point.
+#[cfg(all(feature = "encrypted-wal-handoff", not(miri)))]
+#[tokio::test]
+#[ignore = "run by the predecessor-loss integration tests"]
+async fn encrypted_overlap_predecessor_process() {
+    use turso::encrypted_wal_handoff as handoff;
+
+    if let Some(build) = option_env!("TURSO_ENCRYPTED_OVERLAP_BUILD_LABEL") {
+        eprintln!("encrypted overlap predecessor fixture build {build}");
+    }
+    let directory = std::env::var_os("TURSO_ENCRYPTED_OVERLAP_FIXTURE").expect("fixture directory");
+    let dir = Path::new(&directory);
+    let prepare = match std::env::var("TURSO_ENCRYPTED_OVERLAP_PREDECESSOR_OUTCOME")
+        .expect("predecessor outcome")
+        .as_str()
+    {
+        "prepared" => true,
+        "unprepared" => false,
+        outcome => panic!("unknown predecessor outcome {outcome}"),
+    };
+    let writer = encrypted_builder(&dir.join("overlap.db"), false)
+        .experimental_encryption(true)
+        .experimental_multiprocess_wal(true)
+        .build()
+        .await
+        .expect("open predecessor");
+    let conn = writer.connect().expect("predecessor connection");
+    conn.execute("PRAGMA synchronous=FULL", ())
+        .await
+        .expect("require durable commit");
+    conn.execute(
+        "CREATE TABLE counter(id INTEGER PRIMARY KEY, total INTEGER NOT NULL)",
+        (),
+    )
+    .await
+    .expect("create counter");
+    conn.execute(
+        "CREATE TABLE operations(operation_id TEXT PRIMARY KEY NOT NULL, delta INTEGER NOT NULL)",
+        (),
+    )
+    .await
+    .expect("create operation receipts");
+    conn.execute("INSERT INTO counter VALUES(1, 0)", ())
+        .await
+        .expect("seed counter");
+    let (previous, request) = activation_request();
+    assert_eq!(
+        handoff::enroll(&writer, previous.owner).expect("enroll A"),
+        previous
+    );
+    fs::write(dir.join("crash-predecessor-ready"), b"").expect("signal active predecessor");
+    wait_for(&dir.join("crash-reader-pinned"));
+
+    conn.execute("BEGIN IMMEDIATE", ())
+        .await
+        .expect("begin the operation");
+    conn.execute("UPDATE counter SET total=total+7 WHERE id=1", ())
+        .await
+        .expect("apply the increment");
+    conn.execute("INSERT INTO operations VALUES('increment-0001', 7)", ())
+        .await
+        .expect("record the operation ID");
+    assert_crash_operation(&conn, true).await;
+    if prepare {
+        conn.execute("COMMIT", ())
+            .await
+            .expect("commit the increment and ID together");
+        let boundary = handoff::prepare(&writer, request).expect("publish the prepared receipt");
+        assert!(boundary.committed_frames > 0);
+        let staged = dir.join("crash-position-stage");
+        fs::write(&staged, boundary.wal_position).expect("stage A's prepared position");
+        fs::rename(staged, dir.join("crash-predecessor-prepared"))
+            .expect("signal prepared A with complete position");
+    } else {
+        fs::write(dir.join("crash-predecessor-uncommitted"), b"")
+            .expect("signal A's open write transaction");
+    }
+
+    wait_for(&dir.join("crash-permit-acknowledgement"));
+    if prepare {
+        fs::write(
+            dir.join("crash-application-acknowledgement"),
+            b"increment-0001",
+        )
+        .expect("acknowledge the application operation");
+    }
+}
+
+/// Kill A while B is pinned and verify the outcome against the same files using B's SQL connection.
+#[cfg(all(feature = "encrypted-wal-handoff", not(miri)))]
+async fn verify_predecessor_loss(prepare: bool) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use turso::encrypted_wal_handoff as handoff;
+
+    if let Some(build) = option_env!("TURSO_ENCRYPTED_OVERLAP_BUILD_LABEL") {
+        eprintln!("encrypted overlap successor fixture build {build}");
+    }
+    let directory = tempfile::tempdir().expect("fixture directory");
+    let dir = directory.path();
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("private service directory");
+    let backing_ids = || {
+        ["overlap.db", "overlap.db-wal", "overlap.db-tshm"].map(|name| {
+            let metadata = fs::metadata(dir.join(name)).expect("original database backing");
+            (metadata.dev(), metadata.ino())
+        })
+    };
+    let mut predecessor = CrashPredecessor::spawn(dir, prepare);
+    wait_for(&dir.join("crash-predecessor-ready"));
+    let original_backing = backing_ids();
+    let db = encrypted_builder(&dir.join("overlap.db"), false)
+        .build_encrypted_overlap_reader()
+        .await
+        .expect("attach B while A is alive");
+    let reader = db.connect().expect("original B reader");
+    reader
+        .execute("BEGIN", ())
+        .await
+        .expect("pin B before A applies the operation");
+    assert_crash_operation(&reader, false).await;
+    fs::write(dir.join("crash-reader-pinned"), b"").expect("signal B's read snapshot");
+    let prepared = dir.join("crash-predecessor-prepared");
+    let stopped = if prepare {
+        prepared.clone()
+    } else {
+        dir.join("crash-predecessor-uncommitted")
+    };
+    wait_for(&stopped);
+    if !prepare {
+        let latest = db
+            .connect()
+            .expect("fresh observer of A's open transaction");
+        assert_crash_operation(&latest, false).await;
+    }
+    predecessor.kill_and_reap();
+    assert!(!dir.join("crash-application-acknowledgement").exists());
+    assert_crash_operation(&reader, false).await;
+
+    let (previous, request) = activation_request();
+    if prepare {
+        let boundary = handoff::verify_successor(&reader, previous, request)
+            .expect("authenticate the prepared receipt after A exits");
+        assert_eq!(
+            fs::read(prepared).expect("A's prepared position"),
+            boundary.wal_position
+        );
+        let writer =
+            handoff::activate(&db, &reader, previous, request).expect("activate B after losing A");
+        let recovery = writer.connect().expect("connect recovered writer");
+        assert_crash_operation(&recovery, true).await;
+        assert_crash_operation(&reader, false).await;
+        assert_activated_descriptors(dir, boundary);
+    } else {
+        assert!(!prepared.exists());
+        assert!(handoff::activate(&db, &reader, previous, request).is_err());
+        assert_reader_descriptors(dir);
+    }
+    assert_eq!(backing_ids(), original_backing);
+    reader
+        .execute("COMMIT", ())
+        .await
+        .expect("release B's original snapshot");
+    assert_crash_operation(&reader, prepare).await;
+}
+
+/// Resolve an unacknowledged increment from durable SQL state after A dies with a prepared receipt.
+#[cfg(all(feature = "encrypted-wal-handoff", not(miri)))]
+#[tokio::test]
+async fn managed_encrypted_writer_recovers_prepared_predecessor_loss() {
+    verify_predecessor_loss(true).await;
+}
+
+/// An open transaction with no prepared receipt gives B no authority to write after A dies.
+#[cfg(all(feature = "encrypted-wal-handoff", not(miri)))]
+#[tokio::test]
+async fn managed_encrypted_writer_refuses_unprepared_predecessor_loss() {
+    verify_predecessor_loss(false).await;
+}
+
 /// Refuse a different VFS or an initialized database without shared WAL coordination.
 #[tokio::test]
 async fn encrypted_overlap_refuses_fallback() {
