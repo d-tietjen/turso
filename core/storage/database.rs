@@ -104,6 +104,13 @@ impl Default for IOContext {
 /// the storage medium. A database can either be a file on disk, like in SQLite,
 /// or something like a remote page server service.
 pub trait DatabaseStorage: Send + Sync {
+    /// Identify the opened backing file for a handoff. Custom stores must opt in explicitly.
+    fn opened_file_id(&self) -> Result<crate::io::FileId> {
+        Err(LimboError::InvalidArgument(
+            "opened database identity is unavailable on this storage backend".into(),
+        ))
+    }
+
     /// Reads the encoded prefix of page 1 without applying a page transform.
     ///
     /// This is only for bootstrapping the page layout before a complete page
@@ -138,6 +145,10 @@ pub struct DatabaseFile {
 }
 
 impl DatabaseStorage for DatabaseFile {
+    fn opened_file_id(&self) -> Result<crate::io::FileId> {
+        self.file.opened_file_id()
+    }
+
     #[instrument(skip_all, level = Level::DEBUG)]
     fn read_header(&self, c: Completion) -> Result<Completion> {
         self.file.pread(0, c)

@@ -92,8 +92,16 @@ impl FileId {
 /// Return the OS-level file identity for a path.
 #[cfg(unix)]
 pub fn get_file_id(path: &str) -> Result<FileId, std::io::Error> {
+    unix_metadata_file_id(std::fs::metadata(path))
+}
+
+/// Return identity from metadata obtained from the path or its already-open descriptor.
+#[cfg(unix)]
+fn unix_metadata_file_id(
+    metadata: Result<std::fs::Metadata, std::io::Error>,
+) -> Result<FileId, std::io::Error> {
     use std::os::unix::fs::MetadataExt;
-    let m = std::fs::metadata(path)?;
+    let m = metadata?;
     Ok(FileId {
         dev: m.dev(),
         ino: m.ino(),
@@ -151,6 +159,13 @@ pub trait SharedWalMappedRegion: Send + Sync {
 }
 
 pub trait File: Send + Sync {
+    /// Identify the opened filesystem object. Handoff cannot use a path-derived substitute.
+    fn opened_file_id(&self) -> Result<FileId> {
+        Err(crate::LimboError::InvalidArgument(
+            "opened file identity is unavailable on this I/O backend".into(),
+        ))
+    }
+
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
     fn pread(&self, pos: u64, c: Completion) -> Result<Completion>;

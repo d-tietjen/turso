@@ -98,7 +98,10 @@ async fn encrypted_overlap_reader_process() {
     let result = encrypted_builder(&dir.join("overlap.db"), mode == "wrong-key")
         .build_encrypted_overlap_reader()
         .await;
-    if mode != "reader" && mode != "passive-backfill" {
+    if !matches!(
+        mode.as_str(),
+        "reader" | "passive-backfill" | "write-boundary"
+    ) {
         assert!(result.is_err(), "role must refuse {mode}");
         return;
     }
@@ -107,6 +110,22 @@ async fn encrypted_overlap_reader_process() {
     assert_reader_descriptors(dir);
     if mode == "passive-backfill" {
         assert_eq!(integer(&conn, "SELECT value FROM parent").await, 31);
+        return;
+    }
+    if mode == "write-boundary" {
+        conn.execute("BEGIN", ())
+            .await
+            .expect("pin read transaction");
+        assert_eq!(integer(&conn, "SELECT value FROM parent").await, 31);
+        fs::write(dir.join("boundary-reader-pinned"), b"").expect("signal reader pin");
+        wait_for(&dir.join("boundary-mutations-locked"));
+        assert_eq!(integer(&conn, "SELECT value FROM parent").await, 31);
+        fs::write(dir.join("boundary-reader-checked"), b"").expect("signal pinned read");
+        wait_for(&dir.join("boundary-mutations-unlocked"));
+        conn.execute("COMMIT", ())
+            .await
+            .expect("end read transaction");
+        assert_eq!(integer(&conn, "SELECT value FROM parent").await, 32);
         return;
     }
     assert!(encrypted_builder(&dir.join("overlap.db"), false)
@@ -337,6 +356,97 @@ async fn encrypted_overlap_accepts_durable_passive_backfill() {
         .status()
         .expect("reader")
         .success());
+}
+
+/// Sync a committed writer boundary without losing the separate reader's snapshot.
+#[tokio::test]
+async fn encrypted_write_boundary_preserves_live_reader() {
+    use std::os::unix::fs::MetadataExt;
+    let directory = tempfile::tempdir().expect("fixture directory");
+    let path = directory.path().join("overlap.db");
+    let writer = encrypted_builder(&path, false)
+        .experimental_encryption(true)
+        .experimental_multiprocess_wal(true)
+        .build()
+        .await
+        .expect("open writer");
+    assert!(writer
+        .with_encrypted_wal_write_boundary(|_| panic!("empty database admitted"))
+        .is_err());
+    let conn = writer.connect().expect("writer connection");
+    conn.execute("CREATE TABLE parent(value INTEGER)", ())
+        .await
+        .expect("schema");
+    conn.execute("INSERT INTO parent VALUES(31)", ())
+        .await
+        .expect("seed row");
+    let mut reader = reader_process(directory.path(), "write-boundary")
+        .spawn()
+        .expect("start separate reader");
+    wait_for(&directory.path().join("boundary-reader-pinned"));
+
+    conn.execute("BEGIN IMMEDIATE", ())
+        .await
+        .expect("take mutation lock");
+    conn.execute("UPDATE parent SET value=99", ())
+        .await
+        .expect("uncommitted row");
+    let refused = writer.with_encrypted_wal_write_boundary(|_| panic!("active writer admitted"));
+    assert!(matches!(refused, Err(Error::Busy(_))));
+    conn.execute("ROLLBACK", ())
+        .await
+        .expect("cancel active write");
+    conn.execute("UPDATE parent SET value=32", ())
+        .await
+        .expect("commit final row");
+
+    let started = Instant::now();
+    let (boundary, preparation) = writer
+        .with_encrypted_wal_write_boundary(|boundary| {
+            let preparation = started.elapsed();
+            fs::write(directory.path().join("boundary-mutations-locked"), b"")
+                .expect("signal held mutation locks");
+            wait_for(&directory.path().join("boundary-reader-checked"));
+            (boundary, preparation)
+        })
+        .expect("sync committed backing while reader is pinned");
+    eprintln!(
+        "encrypted writer boundary prepared in {} microseconds",
+        preparation.as_micros()
+    );
+    assert!(boundary.committed_frames > 0);
+    for (name, opened) in [
+        ("overlap.db", boundary.database),
+        ("overlap.db-wal", boundary.wal),
+        ("overlap.db-tshm", boundary.coordinator),
+    ] {
+        let current = fs::metadata(directory.path().join(name)).expect("retained backing");
+        assert_eq!((current.dev(), current.ino()), (opened.dev, opened.ino));
+    }
+    fs::write(directory.path().join("boundary-mutations-unlocked"), b"")
+        .expect("release separate reader");
+    assert!(reader.wait().expect("reap reader").success());
+    conn.execute("UPDATE parent SET value=33", ())
+        .await
+        .expect("mutation locks released");
+    assert_eq!(integer(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").await, 0);
+    let checkpointed = writer
+        .with_encrypted_wal_write_boundary(|boundary| boundary)
+        .expect("initialized database may have an empty WAL");
+    assert_eq!(checkpointed.committed_frames, 0);
+
+    let retained = directory.path().join("retained.db");
+    fs::rename(&path, &retained).expect("stage fixture replacement");
+    fs::write(&path, b"").expect("create different fixture inode");
+    let refused = writer.with_encrypted_wal_write_boundary(|_| panic!("replaced inode admitted"));
+    fs::rename(&retained, &path).expect("restore opened fixture");
+    assert!(refused.is_err());
+    assert_eq!(
+        writer
+            .with_encrypted_wal_write_boundary(|boundary| boundary)
+            .expect("locks released"),
+        checkpointed
+    );
 }
 
 /// Refuse a different VFS or an initialized database without shared WAL coordination.

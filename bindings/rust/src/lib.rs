@@ -162,6 +162,7 @@ pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 pub type Result<T> = std::result::Result<T, Error>;
 pub type EncryptionOpts = turso_sdk_kit::rsapi::EncryptionOpts;
+pub use turso_core::EncryptedWalWriteBoundary;
 
 /// A builder for `Database`.
 pub struct Builder {
@@ -394,6 +395,22 @@ impl Database {
     pub fn connect(&self) -> Result<Connection> {
         let conn = self.inner.connect()?;
         Ok(Connection::create(conn, None))
+    }
+
+    /// Run a transition operation at a synced AES-256-GCM shared WAL boundary.
+    ///
+    /// Stop write admission and drain transactions first. The callback runs
+    /// synchronously with both mutation locks held and must not call back into
+    /// database operations. An active transaction or unresolved WAL returns `Busy`.
+    pub fn with_encrypted_wal_write_boundary<T>(
+        &self,
+        action: impl FnOnce(EncryptedWalWriteBoundary) -> T,
+    ) -> Result<T> {
+        Ok(self
+            .inner
+            .db_core()?
+            .with_encrypted_wal_write_boundary(action)
+            .map_err(TursoError::from)?)
     }
 }
 

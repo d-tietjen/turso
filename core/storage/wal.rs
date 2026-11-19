@@ -5864,6 +5864,24 @@ impl WalFileShared {
         )
     }
 
+    /// Sync the exact WAL backing for a transition with both mutation locks held.
+    /// A physical WAL requiring reconciliation is refused without rebuilding its index.
+    #[cfg(host_shared_wal)]
+    pub(crate) fn sync_handoff_boundary(
+        io: &Arc<dyn IO>,
+        file: &Arc<dyn crate::io::File>,
+        snapshot: SharedWalCoordinationHeader,
+    ) -> Result<crate::io::FileId> {
+        if !matches!(
+            classify_authority_snapshot_against_wal(io, file, snapshot)?,
+            AuthoritySnapshotValidation::Trusted
+        ) {
+            return Err(LimboError::Busy);
+        }
+        io.wait_for_completion(file.sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)?)?;
+        file.opened_file_id()
+    }
+
     #[cfg(host_shared_wal)]
     pub(crate) fn open_shared_from_authority_if_exists(
         io: &Arc<dyn IO>,

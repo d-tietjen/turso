@@ -752,6 +752,19 @@ type ProcessMappingResult = (
     Arc<Mutex<ProcessLocalOwnershipState>>,
 );
 
+/// Holds both mutation locks in checkpoint-then-writer acquisition order.
+struct SharedWalHandoffLocks<'a> {
+    authority: &'a MappedSharedWalCoordination,
+}
+
+impl Drop for SharedWalHandoffLocks<'_> {
+    fn drop(&mut self) {
+        let owner = self.authority.owner_record();
+        self.authority.release_writer(owner);
+        self.authority.release_checkpoint(owner);
+    }
+}
+
 impl MappedSharedWalCoordination {
     const fn default_ownership_mode() -> SharedWalOwnershipMode {
         if cfg!(target_os = "linux") {
@@ -1237,33 +1250,57 @@ impl MappedSharedWalCoordination {
 
     /// Read a consistent snapshot of the shared coordination header.
     pub(crate) fn snapshot(&self) -> SharedWalCoordinationHeader {
-        let header = self.header();
         loop {
-            let seq_before = header.snapshot_seq.load(Ordering::Acquire);
-            if seq_before & 1 != 0 {
-                std::hint::spin_loop();
-                continue;
-            }
-            let snapshot = SharedWalCoordinationHeader {
-                max_frame: header.max_frame.load(Ordering::Acquire),
-                nbackfills: header.nbackfills.load(Ordering::Acquire),
-                transaction_count: header.transaction_count.load(Ordering::Acquire),
-                visibility_generation: header.visibility_generation.load(Ordering::Acquire),
-                checkpoint_seq: header.checkpoint_seq.load(Ordering::Acquire),
-                checkpoint_epoch: header.checkpoint_epoch.load(Ordering::Acquire),
-                page_size: header.page_size.load(Ordering::Acquire),
-                salt_1: header.salt_1.load(Ordering::Acquire),
-                salt_2: header.salt_2.load(Ordering::Acquire),
-                checksum_1: header.checksum_1.load(Ordering::Acquire),
-                checksum_2: header.checksum_2.load(Ordering::Acquire),
-                reader_slot_count: header.reader_slot_count,
-            };
-            let seq_after = header.snapshot_seq.load(Ordering::Acquire);
-            if seq_before == seq_after {
+            if let Some(snapshot) = self.try_snapshot() {
                 return snapshot;
             }
             std::hint::spin_loop();
         }
+    }
+
+    /// Sample the committed boundary once. Incomplete publication requires recovery.
+    #[inline]
+    pub(crate) fn try_snapshot(&self) -> Option<SharedWalCoordinationHeader> {
+        let header = self.header();
+        let seq_before = header.snapshot_seq.load(Ordering::Acquire);
+        if seq_before & 1 != 0 {
+            return None;
+        }
+        let snapshot = SharedWalCoordinationHeader {
+            max_frame: header.max_frame.load(Ordering::Acquire),
+            nbackfills: header.nbackfills.load(Ordering::Acquire),
+            transaction_count: header.transaction_count.load(Ordering::Acquire),
+            visibility_generation: header.visibility_generation.load(Ordering::Acquire),
+            checkpoint_seq: header.checkpoint_seq.load(Ordering::Acquire),
+            checkpoint_epoch: header.checkpoint_epoch.load(Ordering::Acquire),
+            page_size: header.page_size.load(Ordering::Acquire),
+            salt_1: header.salt_1.load(Ordering::Acquire),
+            salt_2: header.salt_2.load(Ordering::Acquire),
+            checksum_1: header.checksum_1.load(Ordering::Acquire),
+            checksum_2: header.checksum_2.load(Ordering::Acquire),
+            reader_slot_count: header.reader_slot_count,
+        };
+        let seq_after = header.snapshot_seq.load(Ordering::Acquire);
+        (seq_before == seq_after).then_some(snapshot)
+    }
+
+    /// Run a bounded transition under the actual writer and checkpoint locks.
+    pub(crate) fn with_handoff_locks<T>(&self, action: impl FnOnce() -> Result<T>) -> Result<T> {
+        let owner = self.owner_record();
+        if !self.try_acquire_checkpoint(owner) {
+            return Err(LimboError::Busy);
+        }
+        if !self.try_acquire_writer(owner) {
+            self.release_checkpoint(owner);
+            return Err(LimboError::Busy);
+        }
+        let _locks = SharedWalHandoffLocks { authority: self };
+        action()
+    }
+
+    /// Identify the open coordination mapping independently of its current pathname.
+    pub(crate) fn opened_file_id(&self) -> Result<crate::io::FileId> {
+        self.file.opened_file_id()
     }
 
     pub(crate) const fn open_mode(&self) -> SharedWalCoordinationOpenMode {
@@ -3162,6 +3199,20 @@ mod tests {
             MappedSharedWalCoordination::open_existing_live(&test_shared_wal_io(), &path, 64),
             Err(LimboError::Busy)
         ));
+    }
+
+    /// Incomplete publication fences handoff and releases both mutation locks.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn handoff_snapshot_refuses_interrupted_publication() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let mapped = create_mapping(&directory.path().join("fixture.tshm"));
+        mapped.header().snapshot_seq.store(1, Ordering::Release);
+        assert!(matches!(
+            mapped.with_handoff_locks(|| mapped.try_snapshot().ok_or(LimboError::Busy)),
+            Err(LimboError::Busy)
+        ));
+        assert!(!mapped.writer_or_checkpoint_lock_active());
     }
 
     #[test]

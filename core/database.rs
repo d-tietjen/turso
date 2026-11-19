@@ -184,6 +184,21 @@ pub struct SharedWalOpenTelemetry {
     pub sanitized_backfill_proof_on_open: bool,
 }
 
+/// An encrypted writer's opened files and durable committed WAL position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncryptedWalWriteBoundary {
+    /// Device and inode of the opened main database.
+    pub database: io::FileId,
+    /// Device and inode of the opened WAL.
+    pub wal: io::FileId,
+    /// Device and inode of the opened coordination mapping.
+    pub coordinator: io::FileId,
+    /// Number of committed frames in the current WAL generation.
+    pub committed_frames: u64,
+    /// Encoded shared WAL position, including the generation and commit checksum.
+    pub wal_position: [u8; 76],
+}
+
 #[cfg(feature = "simulator")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SharedWalTestingSnapshot {
@@ -3110,6 +3125,84 @@ impl Database {
             coordination_open_mode,
             sanitized_backfill_proof_on_open,
         })
+    }
+
+    /// Sync a committed encrypted WAL boundary and pass it to a transition operation.
+    ///
+    /// The existing writer and checkpoint locks remain held for the whole callback.
+    /// The caller must stop admission of new writes before entering and avoid
+    /// reentering database operations from the callback. An active writer,
+    /// incomplete publication, or unreconciled WAL returns `Busy`. Only native
+    /// AES-256-GCM shared-WAL writers on 64-bit Linux support this operation.
+    pub fn with_encrypted_wal_write_boundary<T>(
+        &self,
+        action: impl FnOnce(EncryptedWalWriteBoundary) -> T,
+    ) -> Result<T> {
+        #[cfg(all(host_shared_wal, target_os = "linux", feature = "encryption"))]
+        {
+            use crate::io::FileSyncType;
+            if self.is_readonly() || self.encryption_cipher_mode.get() != CipherMode::Aes256Gcm {
+                return Err(LimboError::InvalidArgument(
+                    "a write boundary requires an AES-256-GCM shared WAL writer".into(),
+                ));
+            }
+            let authority = self.shared_wal_coordination.get().ok_or_else(|| {
+                LimboError::InvalidArgument("the database has no initialized shared WAL".into())
+            })?;
+            authority.with_handoff_locks(|| {
+                if !self.initialized() || self.db_file.size()? == 0 {
+                    return Err(LimboError::InvalidArgument(
+                        "encrypted handoff requires a persisted database page one".into(),
+                    ));
+                }
+                let snapshot = authority.try_snapshot().ok_or(LimboError::Busy)?;
+                if authority.frame_index_overflowed() {
+                    return Err(LimboError::Busy);
+                }
+                let database = self.db_file.opened_file_id()?;
+                let coordinator = authority.opened_file_id()?;
+                let wal_file = self
+                    .shared_wal
+                    .read()
+                    .runtime
+                    .file
+                    .clone()
+                    .ok_or(LimboError::Busy)?;
+                let wal = WalFileShared::sync_handoff_boundary(&self.io, &wal_file, snapshot)?;
+                self.io.wait_for_completion(
+                    self.db_file
+                        .sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)?,
+                )?;
+                self.io
+                    .wait_for_completion(authority.begin_sync(FileSyncType::Fsync)?)?;
+                let coordinator_path = storage::wal::coordination_path_for_wal_path(&self.wal_path);
+                if self.io.file_id(&self.path)? != database
+                    || self.io.file_id(&self.wal_path)? != wal
+                    || self.io.file_id(&coordinator_path)? != coordinator
+                {
+                    return Err(LimboError::InvalidArgument(
+                        "database, WAL, or coordinator path no longer names the opened file".into(),
+                    ));
+                }
+                if authority.try_snapshot() != Some(snapshot) {
+                    return Err(LimboError::Busy);
+                }
+                Ok(action(EncryptedWalWriteBoundary {
+                    database,
+                    wal,
+                    coordinator,
+                    committed_frames: snapshot.max_frame,
+                    wal_position: snapshot.encode(),
+                }))
+            })
+        }
+        #[cfg(not(all(host_shared_wal, target_os = "linux", feature = "encryption")))]
+        {
+            let _ = action;
+            Err(LimboError::InvalidArgument(
+                "encrypted WAL write boundaries require 64-bit Linux with shared WAL".into(),
+            ))
+        }
     }
 
     #[cfg(feature = "simulator")]
