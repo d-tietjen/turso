@@ -664,8 +664,8 @@ impl EncryptionContext {
         self.cipher_mode.tag_size()
     }
 
-    /// Creates Turso header for encrypted page 1
-    fn create_turso_header(&self) -> [u8; TURSO_HEADER_SIZE] {
+    /// Return the cipher-specific magic recorded in authenticated page-one headers.
+    pub(crate) fn create_turso_header(&self) -> [u8; TURSO_HEADER_SIZE] {
         let mut header = [0u8; TURSO_HEADER_SIZE];
 
         // "Turso" prefix (5 bytes)

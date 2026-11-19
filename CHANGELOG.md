@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### 0.8.4
+
+* Rust bindings can attach a read-only AES-256-GCM observer to an existing live multiprocess WAL on 64-bit Linux.
+* The observer verifies both legacy and current checkpoint proofs against an authenticated database page. (EDEN-3906)
+
 ## 0.8.2 -- 2026-10-12
 
 ### Fixed

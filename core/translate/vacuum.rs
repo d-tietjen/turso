@@ -24,6 +24,9 @@ pub fn translate_vacuum(
     into: Option<&Expr>,
     connection: Arc<Connection>,
 ) -> Result<()> {
+    if connection.db.is_encrypted_overlap_reader() {
+        return Err(LimboError::ReadOnly);
+    }
     let schema_name = schema_name.map_or_else(|| "main".to_string(), |n| n.as_str().to_string());
     match into {
         Some(dest_expr) => {

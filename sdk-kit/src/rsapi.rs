@@ -582,6 +582,8 @@ fn open_flags_from_capi(flags: u32) -> Result<OpenFlags, TursoError> {
 
 pub struct TursoDatabase {
     config: TursoDatabaseConfig,
+    /// This database requires authenticated attachment to a live coordinator.
+    encrypted_overlap_reader: bool,
     open_state: Mutex<TursoDatabaseOpenState>,
     db: Arc<Mutex<Option<Arc<Database>>>>,
     io: Mutex<Option<Arc<dyn turso_core::IO>>>,
@@ -894,8 +896,42 @@ impl TursoDatabase {
     /// create database holder struct but do not initialize it yet
     /// this can be useful for some environments, where IO operations must be executed in certain fashion (and open do IO under the hood)
     pub fn new(config: TursoDatabaseConfig) -> Arc<Self> {
+        Self::new_with_role(config, false)
+    }
+
+    /// Construct an encrypted read-only observer using the built-in Linux filesystem.
+    /// An existing usable coordinator is checked during open, after key validation.
+    pub fn new_encrypted_overlap_reader(
+        mut config: TursoDatabaseConfig,
+    ) -> Result<Arc<Self>, TursoError> {
+        if !cfg!(all(
+            target_os = "linux",
+            target_pointer_width = "64",
+            feature = "encryption"
+        )) || !matches!(config.vfs, IoBackend::Default | IoBackend::Syscall)
+            || config.io.is_some()
+            || config.db_file.is_some()
+            || config.page_codec.is_some()
+            || config.path.starts_with(":memory:")
+            || config
+                .encryption
+                .as_ref()
+                .is_none_or(|opts| opts.cipher != "aes256gcm")
+        {
+            return Err(TursoError::Misuse(
+                "encrypted overlap requires AES-256-GCM and a native file backend on 64-bit Linux"
+                    .to_string(),
+            ));
+        }
+        config.open_flags = OpenFlags::ReadOnly | OpenFlags::NoLock;
+        Ok(Self::new_with_role(config, true))
+    }
+
+    /// Set the role before any database file is opened.
+    fn new_with_role(config: TursoDatabaseConfig, encrypted_overlap_reader: bool) -> Arc<Self> {
         Arc::new(Self {
             config,
+            encrypted_overlap_reader,
             db: Arc::new(Mutex::new(None)),
             open_state: Mutex::new(TursoDatabaseOpenState::new()),
             io: Mutex::new(None),
@@ -984,7 +1020,10 @@ impl TursoDatabase {
                     // OpenFlags::NoLock when multiprocess WAL is enabled — taking
                     // the OS-level fcntl lock here would block every other
                     // multiprocess process from opening the same file.
-                    let opts = self.config.database_opts();
+                    let mut opts = self.config.database_opts();
+                    if self.encrypted_overlap_reader {
+                        opts = opts.with_encrypted_overlap_reader();
+                    }
 
                     if self.config.encryption.is_some() && !opts.enable_encryption {
                         return Err(TursoError::Error(
