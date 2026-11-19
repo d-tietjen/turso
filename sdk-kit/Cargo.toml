@@ -10,6 +10,7 @@ repository.workspace = true
 [features]
 default = ["encryption", "pure-rust-crypto"]
 encryption = ["turso_core/encryption"]
+encrypted-wal-handoff = ["turso_core/encrypted-wal-handoff"]
 pure-rust-crypto = ["turso_core/pure-rust-crypto"]
 fts = ["turso_core/fts"]
 

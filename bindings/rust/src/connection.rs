@@ -83,6 +83,47 @@ impl Clone for Connection {
 }
 
 impl Connection {
+    /// Keep the attached reader stable while native handoff verification uses its pager.
+    #[cfg(all(
+        feature = "encrypted-wal-handoff",
+        target_os = "linux",
+        target_pointer_width = "64",
+        not(miri)
+    ))]
+    pub(crate) fn verify_encrypted_wal_successor(
+        &self,
+        previous: turso_core::WriterClaim,
+        transfer: turso_core::WriterTransfer,
+    ) -> Result<turso_core::EncryptedWalWriteBoundary> {
+        let _operation = self.acquire_exclusive_operation()?;
+        let reader = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Error::Misuse("handoff reader must be open".into()))?;
+        Ok(reader.verify_encrypted_wal_successor(previous, transfer)?)
+    }
+
+    /// Keep the authenticated reader stable while activating the separate writer.
+    #[cfg(all(
+        feature = "encrypted-wal-handoff",
+        target_os = "linux",
+        target_pointer_width = "64",
+        not(miri)
+    ))]
+    pub(crate) fn activate_encrypted_wal_successor(
+        &self,
+        database: &turso_sdk_kit::rsapi::TursoDatabase,
+        previous: turso_core::WriterClaim,
+        transfer: turso_core::WriterTransfer,
+    ) -> Result<Arc<turso_sdk_kit::rsapi::TursoDatabase>> {
+        let _operation = self.acquire_exclusive_operation()?;
+        let reader = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Error::Misuse("handoff reader must be open".into()))?;
+        Ok(database.activate_encrypted_wal_successor(reader, previous, transfer)?)
+    }
+
     pub(crate) fn create(
         conn: Arc<turso_sdk_kit::rsapi::TursoConnection>,
         extra_io: Option<Arc<dyn Fn(Waker) -> Result<()> + Send + Sync>>,

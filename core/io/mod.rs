@@ -65,6 +65,8 @@ mod common;
 mod completions;
 pub use clock::Clock;
 pub use completions::*;
+#[cfg(encrypted_wal_handoff)]
+pub(crate) use unix::{handoff_file, unix_shared_wal_lock_byte};
 
 /// Platform-independent file identity, analogous to SQLite's `struct unixFileId`.
 /// On Unix: (st_dev, st_ino). On Windows: (dwVolumeSerialNumber, nFileIndex).
@@ -92,8 +94,16 @@ impl FileId {
 /// Return the OS-level file identity for a path.
 #[cfg(unix)]
 pub fn get_file_id(path: &str) -> Result<FileId, std::io::Error> {
+    unix_metadata_file_id(std::fs::metadata(path))
+}
+
+/// Return identity from metadata obtained from the path or its already-open descriptor.
+#[cfg(unix)]
+fn unix_metadata_file_id(
+    metadata: Result<std::fs::Metadata, std::io::Error>,
+) -> Result<FileId, std::io::Error> {
     use std::os::unix::fs::MetadataExt;
-    let m = std::fs::metadata(path)?;
+    let m = metadata?;
     Ok(FileId {
         dev: m.dev(),
         ino: m.ino(),
@@ -151,6 +161,13 @@ pub trait SharedWalMappedRegion: Send + Sync {
 }
 
 pub trait File: Send + Sync {
+    /// Identify the opened filesystem object. Handoff cannot use a path-derived substitute.
+    fn opened_file_id(&self) -> Result<FileId> {
+        Err(crate::LimboError::InvalidArgument(
+            "opened file identity is unavailable on this I/O backend".into(),
+        ))
+    }
+
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
     fn pread(&self, pos: u64, c: Completion) -> Result<Completion>;
@@ -422,6 +439,12 @@ impl Default for OpenFlags {
 }
 
 pub trait IO: Clock + Send + Sync {
+    /// Whether managed handoff can rely on native file identity and synchronous writes.
+    #[cfg(encrypted_wal_handoff)]
+    fn supports_encrypted_wal_handoff(&self) -> bool {
+        false
+    }
+
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>>;
 
     fn open_shared_wal_file(&self, path: &str) -> Result<Arc<dyn File>> {

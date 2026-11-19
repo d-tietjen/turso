@@ -927,6 +927,52 @@ impl TursoDatabase {
         Ok(Self::new_with_role(config, true))
     }
 
+    /// Activate a writable successor using a connection from this overlap reader.
+    /// The returned handle uses the same credentials and native I/O. Existing
+    /// connections keep their read-only databases and snapshots.
+    #[cfg(all(
+        feature = "encrypted-wal-handoff",
+        target_os = "linux",
+        target_pointer_width = "64",
+        not(miri)
+    ))]
+    pub fn activate_encrypted_wal_successor(
+        &self,
+        reader: &TursoConnection,
+        previous: turso_core::WriterClaim,
+        transfer: turso_core::WriterTransfer,
+    ) -> Result<Arc<Self>, TursoError> {
+        if !self.encrypted_overlap_reader {
+            return Err(TursoError::Misuse(
+                "handoff activation requires an overlap reader database".into(),
+            ));
+        }
+        let reader_guard = reader.concurrent_guard.clone();
+        let _operation = reader_guard.try_use()?;
+        let mut config = self.config.clone();
+        let encryption = config.encryption.clone().ok_or_else(|| {
+            TursoError::Misuse("handoff activation requires reader credentials".into())
+        })?;
+        let db = self.db_core()?.activate_encrypted_wal_successor(
+            &reader.connection,
+            encryption,
+            previous,
+            transfer,
+        )?;
+        config.open_flags = OpenFlags::NoLock;
+        let io = db.io.clone();
+        Ok(Arc::new(Self {
+            config,
+            encrypted_overlap_reader: false,
+            db: Arc::new(Mutex::new(Some(db))),
+            open_state: Mutex::new(TursoDatabaseOpenState {
+                phase: TursoDatabaseOpenPhase::Done,
+                ..TursoDatabaseOpenState::new()
+            }),
+            io: Mutex::new(Some(io)),
+        }))
+    }
+
     /// Set the role before any database file is opened.
     fn new_with_role(config: TursoDatabaseConfig, encrypted_overlap_reader: bool) -> Arc<Self> {
         Arc::new(Self {
@@ -1009,6 +1055,10 @@ impl TursoDatabase {
                             "database must be opened only once".to_string(),
                         ));
                     }
+                    turso_core::Database::check_handoff_open(
+                        &self.config.path,
+                        self.encrypted_overlap_reader,
+                    )?;
                     // keep lock for the whole method since open_async must be called only once and never will be called concurrently
 
                     let io: Arc<dyn turso_core::IO> = self.open_vfs_io()?;
@@ -1182,6 +1232,23 @@ pub struct TursoConnection {
 }
 
 impl TursoConnection {
+    /// Verify a durable handoff on an authenticated native reader.
+    #[cfg(all(
+        feature = "encrypted-wal-handoff",
+        target_os = "linux",
+        target_pointer_width = "64",
+        not(miri)
+    ))]
+    pub fn verify_encrypted_wal_successor(
+        &self,
+        previous: turso_core::WriterClaim,
+        transfer: turso_core::WriterTransfer,
+    ) -> Result<turso_core::EncryptedWalWriteBoundary, TursoError> {
+        self.connection
+            .verify_encrypted_wal_successor(previous, transfer)
+            .map_err(TursoError::from)
+    }
+
     pub fn new(config: &TursoDatabaseConfig, connection: Arc<Connection>) -> Arc<Self> {
         Self::new_with_sync_busy(config, connection, None)
     }

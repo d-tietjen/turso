@@ -127,9 +127,9 @@ pub(crate) use connection::{AtomicTransactionState, TransactionState};
 pub use database::{clear_database_registry, SharedWalTestingSnapshot};
 pub(crate) use database::{is_memory_like, DatabaseCatalog, InitState};
 pub use database::{
-    ConnectAsyncState, Database, DatabaseAllocators, DatabaseOpts, EncryptionOpts,
-    OpenDbAsyncPhase, OpenDbAsyncState, OpenOptions, SharedWalCoordinationOpenTelemetryMode,
-    SharedWalOpenTelemetry,
+    ConnectAsyncState, Database, DatabaseAllocators, DatabaseOpts, EncryptedWalWriteBoundary,
+    EncryptionOpts, OpenDbAsyncPhase, OpenDbAsyncState, OpenOptions,
+    SharedWalCoordinationOpenTelemetryMode, SharedWalOpenTelemetry,
 };
 #[cfg(test)]
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
@@ -157,6 +157,8 @@ pub use io::{
 };
 pub use numeric::{nonnan::NonNan, Numeric};
 pub use statement::{ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter};
+#[cfg(encrypted_wal_handoff)]
+pub use storage::encrypted_wal_handoff::{TransferId, WriterClaim, WriterId, WriterTransfer};
 pub use storage::{
     buffer_pool::BufferPool,
     database::{DatabaseStorage, IOContext},

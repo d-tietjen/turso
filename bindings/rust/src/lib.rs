@@ -162,6 +162,7 @@ pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 pub type Result<T> = std::result::Result<T, Error>;
 pub type EncryptionOpts = turso_sdk_kit::rsapi::EncryptionOpts;
+pub use turso_core::EncryptedWalWriteBoundary;
 
 /// A builder for `Database`.
 pub struct Builder {
@@ -394,6 +395,90 @@ impl Database {
     pub fn connect(&self) -> Result<Connection> {
         let conn = self.inner.connect()?;
         Ok(Connection::create(conn, None))
+    }
+
+    /// Run a transition operation at a synced AES-256-GCM shared WAL boundary.
+    ///
+    /// Stop write admission and drain transactions first. The callback runs
+    /// synchronously with both mutation locks held and must not call back into
+    /// database operations. An active transaction or unresolved WAL returns `Busy`.
+    pub fn with_encrypted_wal_write_boundary<T>(
+        &self,
+        action: impl FnOnce(EncryptedWalWriteBoundary) -> T,
+    ) -> Result<T> {
+        Ok(self
+            .inner
+            .db_core()?
+            .with_encrypted_wal_write_boundary(action)
+            .map_err(TursoError::from)?)
+    }
+}
+
+/// Lifecycle controls for an embedded AES-256-GCM database on 64-bit Linux.
+#[cfg(all(
+    feature = "encrypted-wal-handoff",
+    target_os = "linux",
+    target_pointer_width = "64",
+    not(miri)
+))]
+pub mod encrypted_wal_handoff {
+    use super::{Connection, Database, EncryptedWalWriteBoundary, Result, TursoError};
+    pub use turso_core::{TransferId, WriterClaim, WriterId, WriterTransfer};
+
+    /// Enroll a quiescent native writer before allowing any successor to attach.
+    /// The controller must already own the private backing and exclude other writers.
+    pub fn enroll(database: &Database, owner: WriterId) -> Result<WriterClaim> {
+        Ok(database
+            .inner
+            .db_core()?
+            .enroll_encrypted_wal_writer(owner)
+            .map_err(TursoError::from)?)
+    }
+
+    /// Publish the exact boundary and fence the predecessor. A live writer or
+    /// checkpoint returns Busy so the controller can finish draining it.
+    pub fn prepare(
+        database: &Database,
+        transfer: WriterTransfer,
+    ) -> Result<EncryptedWalWriteBoundary> {
+        Ok(database
+            .inner
+            .db_core()?
+            .prepare_encrypted_wal_handoff(transfer)
+            .map_err(TursoError::from)?)
+    }
+
+    /// Reactivate the predecessor if the transfer has never been accepted.
+    pub fn rollback(database: &Database, transfer: WriterTransfer) -> Result<()> {
+        Ok(database
+            .inner
+            .db_core()?
+            .rollback_encrypted_wal_handoff(transfer)
+            .map_err(TursoError::from)?)
+    }
+
+    /// Authenticate the original files from a live overlap reader and verify
+    /// the prepared position without consuming the reader's SQL snapshot.
+    pub fn verify_successor(
+        reader: &Connection,
+        previous: WriterClaim,
+        transfer: WriterTransfer,
+    ) -> Result<EncryptedWalWriteBoundary> {
+        reader.verify_encrypted_wal_successor(previous, transfer)
+    }
+
+    /// Accept the prepared transfer and return a writable database over the same files.
+    /// `reader` must be an open connection from the original overlap `database`.
+    /// Its existing read snapshot remains valid. Retrying the same accepted request
+    /// while its writer is live returns a handle to that writer.
+    pub fn activate(
+        database: &Database,
+        reader: &Connection,
+        previous: WriterClaim,
+        transfer: WriterTransfer,
+    ) -> Result<Database> {
+        let inner = reader.activate_encrypted_wal_successor(&database.inner, previous, transfer)?;
+        Ok(Database { inner })
     }
 }
 

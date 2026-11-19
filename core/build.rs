@@ -9,6 +9,15 @@ fn main() {
         host_shared_wal: { all(any(unix, target_os = "windows"), target_pointer_width = "64") },
     }
 
+    println!("cargo::rustc-check-cfg=cfg(encrypted_wal_handoff)");
+    if env::var_os("CARGO_FEATURE_ENCRYPTED_WAL_HANDOFF").is_some()
+        && env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
+        && env::var("CARGO_CFG_TARGET_POINTER_WIDTH").as_deref() == Ok("64")
+        && env::var_os("CARGO_CFG_MIRI").is_none()
+    {
+        println!("cargo::rustc-cfg=encrypted_wal_handoff");
+    }
+
     // Ensure Cargo reruns when this script or the reproducibility seed changes.
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-env-changed=SOURCE_DATE_EPOCH");
