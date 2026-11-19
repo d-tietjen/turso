@@ -466,6 +466,20 @@ pub mod encrypted_wal_handoff {
     ) -> Result<EncryptedWalWriteBoundary> {
         reader.verify_encrypted_wal_successor(previous, transfer)
     }
+
+    /// Accept the prepared transfer and return a writable database over the same files.
+    /// `reader` must be an open connection from the original overlap `database`.
+    /// Its existing read snapshot remains valid. Retrying the same accepted request
+    /// while its writer is live returns a handle to that writer.
+    pub fn activate(
+        database: &Database,
+        reader: &Connection,
+        previous: WriterClaim,
+        transfer: WriterTransfer,
+    ) -> Result<Database> {
+        let inner = reader.activate_encrypted_wal_successor(&database.inner, previous, transfer)?;
+        Ok(Database { inner })
+    }
 }
 
 /// A prepared statement.

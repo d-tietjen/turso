@@ -55,6 +55,17 @@ fn reader_process(directory: &Path, mode: &str) -> Command {
     command
 }
 
+/// Read the Linux access mode of an open backing descriptor.
+fn descriptor_access_mode(fd: &fs::DirEntry) -> usize {
+    let path = Path::new("/proc/self/fdinfo").join(fd.file_name());
+    let info = fs::read_to_string(path).expect("descriptor flags");
+    let flags = info
+        .lines()
+        .find_map(|line| line.strip_prefix("flags:"))
+        .expect("flags");
+    usize::from_str_radix(flags.trim(), 8).expect("octal flags") & 3
+}
+
 /// Verify the access mode of each retained file in the reader process.
 fn assert_reader_descriptors(directory: &Path) {
     let expected = [
@@ -70,14 +81,7 @@ fn assert_reader_descriptors(directory: &Path) {
         };
         for (index, (name, access)) in expected.iter().enumerate() {
             if target == directory.join(name) {
-                let path = Path::new("/proc/self/fdinfo").join(fd.file_name());
-                let info = fs::read_to_string(path).expect("descriptor flags");
-                let flags = info
-                    .lines()
-                    .find_map(|line| line.strip_prefix("flags:"))
-                    .expect("flags");
-                let mode = u32::from_str_radix(flags.trim(), 8).expect("octal flags") & 3;
-                assert_eq!(mode, *access, "{name}");
+                assert_eq!(descriptor_access_mode(&fd), *access, "{name}");
                 seen[index] = true;
             }
         }
@@ -98,16 +102,25 @@ async fn encrypted_overlap_reader_process() {
     let result = encrypted_builder(&dir.join("overlap.db"), mode == "wrong-key")
         .build_encrypted_overlap_reader()
         .await;
-    if !matches!(
-        mode.as_str(),
-        "reader" | "passive-backfill" | "write-boundary" | "managed-receipt"
-    ) {
+    let managed_activation =
+        cfg!(all(feature = "encrypted-wal-handoff", not(miri))) && mode == "managed-activation";
+    if !managed_activation
+        && !matches!(
+            mode.as_str(),
+            "reader" | "passive-backfill" | "write-boundary" | "managed-receipt"
+        )
+    {
         assert!(result.is_err(), "role must refuse {mode}");
         return;
     }
     let db = result.expect("attach encrypted overlap reader");
     let conn = db.connect().expect("reader connection");
     assert_reader_descriptors(dir);
+    #[cfg(all(feature = "encrypted-wal-handoff", not(miri)))]
+    if managed_activation {
+        run_managed_activation_successor(dir, &db, &conn).await;
+        return;
+    }
     if mode == "passive-backfill" {
         assert_eq!(integer(&conn, "SELECT value FROM parent").await, 31);
         return;
@@ -540,6 +553,211 @@ async fn managed_encrypted_writer_rollback_preserves_separate_reader() {
         .await
         .expect("resume predecessor writes");
     assert_eq!(integer(&conn, "SELECT value FROM parent").await, 33);
+}
+
+/// Use the same synthetic owner, epoch, and request in both activation processes.
+#[cfg(all(feature = "encrypted-wal-handoff", not(miri)))]
+fn activation_request() -> (
+    turso::encrypted_wal_handoff::WriterClaim,
+    turso::encrypted_wal_handoff::WriterTransfer,
+) {
+    use std::num::{NonZeroU128, NonZeroU64};
+    use turso::encrypted_wal_handoff::{TransferId, WriterClaim, WriterId, WriterTransfer};
+
+    (
+        WriterClaim {
+            owner: WriterId(NonZeroU128::MIN),
+            epoch: NonZeroU64::MIN,
+        },
+        WriterTransfer {
+            id: TransferId(NonZeroU128::MIN),
+            successor: WriterId(NonZeroU128::new(2).expect("successor ID")),
+        },
+    )
+}
+
+/// Observe the original read-only files and the successor's writable files by descriptor.
+#[cfg(all(feature = "encrypted-wal-handoff", not(miri)))]
+fn assert_activated_descriptors(directory: &Path, boundary: turso::EncryptedWalWriteBoundary) {
+    use std::os::unix::fs::MetadataExt;
+
+    let expected = [
+        ("overlap.db", boundary.database),
+        ("overlap.db-wal", boundary.wal),
+        ("overlap.db-tshm", boundary.coordinator),
+    ];
+    let mut access_modes = [[false; 3]; 3];
+    for fd in fs::read_dir("/proc/self/fd").expect("successor descriptors") {
+        let fd = fd.expect("descriptor entry");
+        let Ok(target) = fs::read_link(fd.path()) else {
+            continue;
+        };
+        for (index, (name, opened)) in expected.iter().enumerate() {
+            if target != directory.join(name) {
+                continue;
+            }
+            let metadata = fs::metadata(fd.path()).expect("stat the open backing descriptor");
+            assert_eq!(
+                (metadata.dev(), metadata.ino()),
+                (opened.dev, opened.ino),
+                "{name}"
+            );
+            access_modes[index][descriptor_access_mode(&fd)] = true;
+        }
+    }
+    assert_eq!(
+        access_modes,
+        [
+            [true, false, true],
+            [true, false, true],
+            [false, false, true]
+        ]
+    );
+}
+
+/// Activate from an existing reader and retain its original snapshot through the successor commit.
+#[cfg(all(feature = "encrypted-wal-handoff", not(miri)))]
+async fn run_managed_activation_successor(dir: &Path, db: &turso::Database, reader: &Connection) {
+    use turso::encrypted_wal_handoff as handoff;
+
+    reader
+        .execute("BEGIN", ())
+        .await
+        .expect("pin original reader");
+    assert_eq!(integer(reader, "SELECT value FROM parent").await, 31);
+    fs::write(dir.join("activation-reader-pinned"), b"").expect("signal pinned reader");
+    wait_for(&dir.join("activation-prepared"));
+
+    let (previous, request) = activation_request();
+    let boundary = handoff::verify_successor(reader, previous, request).expect("verify prepare");
+    assert_eq!(
+        fs::read(dir.join("activation-prepared")).expect("read prepared position"),
+        boundary.wal_position
+    );
+    let activation_started = Instant::now();
+    let writer = handoff::activate(db, reader, previous, request).expect("activate successor");
+    eprintln!(
+        "encrypted WAL successor activation {} us",
+        activation_started.elapsed().as_micros()
+    );
+    let writer_conn = writer.connect().expect("successor writer connection");
+    assert_eq!(integer(&writer_conn, "SELECT value FROM parent").await, 32);
+    assert_activated_descriptors(dir, boundary);
+    let commit_started = Instant::now();
+    writer_conn
+        .execute("UPDATE parent SET value=33", ())
+        .await
+        .expect("commit successor write");
+    eprintln!(
+        "encrypted WAL successor first commit {} us",
+        commit_started.elapsed().as_micros()
+    );
+    assert_eq!(integer(reader, "SELECT value FROM parent").await, 31);
+
+    let retried = handoff::activate(db, reader, previous, request).expect("retry activation");
+    let retried_conn = retried
+        .connect()
+        .expect("connection from retried activation");
+    assert_eq!(integer(&retried_conn, "SELECT value FROM parent").await, 33);
+    drop(retried_conn);
+    drop(retried);
+    drop(writer_conn);
+    drop(writer);
+    assert_reader_descriptors(dir);
+    assert_eq!(integer(reader, "SELECT value FROM parent").await, 31);
+
+    let writer =
+        handoff::activate(db, reader, previous, request).expect("reopen accepted successor");
+    let writer_conn = writer
+        .connect()
+        .expect("connection from reopened activation");
+    assert_eq!(integer(&writer_conn, "SELECT value FROM parent").await, 33);
+    reader
+        .execute("COMMIT", ())
+        .await
+        .expect("release original snapshot");
+    assert_eq!(integer(reader, "SELECT value FROM parent").await, 33);
+    assert!(matches!(
+        reader.execute("UPDATE parent SET value=99", ()).await,
+        Err(Error::Readonly(_))
+    ));
+    assert_activated_descriptors(dir, boundary);
+    fs::write(dir.join("activation-successor-committed"), b"").expect("signal successor commit");
+    wait_for(&dir.join("activation-predecessor-checked"));
+    assert_eq!(integer(&writer_conn, "SELECT value FROM parent").await, 33);
+}
+
+/// Transfer real writer custody between processes without replacing any backing file.
+#[cfg(all(feature = "encrypted-wal-handoff", not(miri)))]
+#[tokio::test]
+async fn managed_encrypted_writer_activates_separate_successor() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use turso::encrypted_wal_handoff as handoff;
+
+    let directory = tempfile::tempdir().expect("fixture directory");
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+        .expect("private service directory");
+    let path = directory.path().join("overlap.db");
+    let writer = encrypted_builder(&path, false)
+        .experimental_encryption(true)
+        .experimental_multiprocess_wal(true)
+        .build()
+        .await
+        .expect("open predecessor");
+    let conn = writer.connect().expect("predecessor writer connection");
+    conn.execute("CREATE TABLE parent(value INTEGER)", ())
+        .await
+        .expect("schema");
+    conn.execute("INSERT INTO parent VALUES(31)", ())
+        .await
+        .expect("seed row");
+    let (previous, request) = activation_request();
+    assert_eq!(
+        handoff::enroll(&writer, previous.owner).expect("enroll predecessor"),
+        previous
+    );
+
+    let mut successor = reader_process(directory.path(), "managed-activation")
+        .spawn()
+        .expect("start separate successor");
+    wait_for(&directory.path().join("activation-reader-pinned"));
+    conn.execute("UPDATE parent SET value=32", ())
+        .await
+        .expect("final predecessor commit");
+    let prepare_started = Instant::now();
+    let boundary = handoff::prepare(&writer, request).expect("prepare successor");
+    eprintln!(
+        "encrypted WAL predecessor prepare {} us",
+        prepare_started.elapsed().as_micros()
+    );
+    assert!(boundary.committed_frames > 0);
+    let prepared = directory.path().join("activation-prepared");
+    let staged = directory.path().join("activation-prepared-stage");
+    fs::write(&staged, boundary.wal_position).expect("record prepared position");
+    fs::rename(staged, prepared).expect("signal prepare with complete position");
+    wait_for(&directory.path().join("activation-successor-committed"));
+
+    assert!(matches!(
+        conn.execute("UPDATE parent SET value=100", ()).await,
+        Err(Error::Busy(_))
+    ));
+    assert_eq!(integer(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").await, 1);
+    assert!(handoff::rollback(&writer, request).is_err());
+    for (name, opened) in [
+        ("overlap.db", boundary.database),
+        ("overlap.db-wal", boundary.wal),
+        ("overlap.db-tshm", boundary.coordinator),
+    ] {
+        let current = fs::metadata(directory.path().join(name)).expect("retained backing");
+        assert_eq!(
+            (current.dev(), current.ino()),
+            (opened.dev, opened.ino),
+            "{name}"
+        );
+    }
+    fs::write(directory.path().join("activation-predecessor-checked"), b"")
+        .expect("release successor");
+    assert!(successor.wait().expect("reap successor").success());
 }
 
 /// Refuse a different VFS or an initialized database without shared WAL coordination.
