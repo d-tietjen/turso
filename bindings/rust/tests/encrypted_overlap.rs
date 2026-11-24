@@ -99,6 +99,20 @@ async fn encrypted_overlap_reader_process() {
     let dir = std::env::var_os("TURSO_ENCRYPTED_OVERLAP_FIXTURE").expect("fixture directory");
     let dir = Path::new(&dir);
     let mode = std::env::var("TURSO_ENCRYPTED_OVERLAP_TEST_MODE").expect("test mode");
+    if mode == "ordinary-passive-backfill" {
+        let db = encrypted_builder(&dir.join("overlap.db"), false)
+            .experimental_encryption(true)
+            .experimental_multiprocess_wal(true)
+            .build()
+            .await
+            .expect("join encrypted WAL after passive checkpoint");
+        let conn = db.connect().expect("joined connection");
+        assert_eq!(integer(&conn, "SELECT value FROM parent").await, 31);
+        conn.execute("UPDATE parent SET value=32", ())
+            .await
+            .expect("commit from joined connection");
+        return;
+    }
     let result = encrypted_builder(&dir.join("overlap.db"), mode == "wrong-key")
         .build_encrypted_overlap_reader()
         .await;
@@ -392,6 +406,11 @@ async fn encrypted_overlap_accepts_durable_passive_backfill() {
         .status()
         .expect("reader")
         .success());
+    assert!(reader_process(dir.path(), "ordinary-passive-backfill")
+        .status()
+        .expect("ordinary multiprocess participant")
+        .success());
+    assert_eq!(integer(&conn, "SELECT value FROM parent").await, 32);
 }
 
 /// Sync a committed writer boundary without losing the separate reader's snapshot.
