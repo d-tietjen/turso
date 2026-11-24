@@ -932,7 +932,7 @@ async fn encrypted_overlap_predecessor_process() {
     }
 }
 
-/// Kill A while B is pinned and verify the outcome against the same files using B's SQL connection.
+/// Reap A and verify B's snapshot and write authority against the original backing files.
 #[cfg(all(feature = "encrypted-wal-handoff", not(miri)))]
 async fn verify_predecessor_loss(prepare: bool) {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -993,22 +993,71 @@ async fn verify_predecessor_loss(prepare: bool) {
             handoff::activate(&db, &reader, previous, request).expect("activate B after losing A");
         let recovery = writer.connect().expect("connect recovered writer");
         assert_crash_operation(&recovery, true).await;
+        recovery
+            .execute("PRAGMA synchronous=FULL", ())
+            .await
+            .expect("require durable successor commit");
+        recovery
+            .execute("BEGIN IMMEDIATE", ())
+            .await
+            .expect("begin the successor operation");
+        recovery
+            .execute("UPDATE counter SET total=total+11 WHERE id=1", ())
+            .await
+            .expect("apply the successor increment");
+        recovery
+            .execute("INSERT INTO operations VALUES('increment-0002', 11)", ())
+            .await
+            .expect("record the successor operation ID");
+        recovery
+            .execute("COMMIT", ())
+            .await
+            .expect("commit the successor operation after A exits");
         assert_crash_operation(&reader, false).await;
+        reader
+            .execute("COMMIT", ())
+            .await
+            .expect("release B's original snapshot");
+        assert_eq!(
+            integer(&recovery, "PRAGMA wal_checkpoint(TRUNCATE)").await,
+            0
+        );
+        assert_eq!(
+            fs::metadata(dir.join("overlap.db-wal"))
+                .expect("retained WAL")
+                .len(),
+            0
+        );
+        assert_eq!(
+            integer(&reader, "SELECT total FROM counter WHERE id=1").await,
+            18
+        );
+        assert_eq!(integer(&reader, "SELECT count(*) FROM operations").await, 2);
+        assert_eq!(
+            integer(
+                &reader,
+                "SELECT count(*) FROM operations
+                 WHERE (operation_id='increment-0001' AND delta=7)
+                    OR (operation_id='increment-0002' AND delta=11)"
+            )
+            .await,
+            2
+        );
         assert_activated_descriptors(dir, boundary);
     } else {
         assert!(!prepared.exists());
         assert!(handoff::activate(&db, &reader, previous, request).is_err());
         assert_reader_descriptors(dir);
+        reader
+            .execute("COMMIT", ())
+            .await
+            .expect("release B's original snapshot");
+        assert_crash_operation(&reader, false).await;
     }
     assert_eq!(backing_ids(), original_backing);
-    reader
-        .execute("COMMIT", ())
-        .await
-        .expect("release B's original snapshot");
-    assert_crash_operation(&reader, prepare).await;
 }
 
-/// Resolve an unacknowledged increment from durable SQL state after A dies with a prepared receipt.
+/// Recover A's unacknowledged increment and commit a new operation after A exits.
 #[cfg(all(feature = "encrypted-wal-handoff", not(miri)))]
 #[tokio::test]
 async fn managed_encrypted_writer_recovers_prepared_predecessor_loss() {

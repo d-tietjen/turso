@@ -205,6 +205,19 @@ impl WalSnapshot {
     }
 }
 
+#[cfg(host_shared_wal)]
+impl From<SharedWalCoordinationHeader> for WalSnapshot {
+    fn from(snapshot: SharedWalCoordinationHeader) -> Self {
+        Self {
+            max_frame: snapshot.max_frame,
+            nbackfills: snapshot.nbackfills,
+            last_checksum: (snapshot.checksum_1, snapshot.checksum_2),
+            checkpoint_seq: snapshot.checkpoint_seq,
+            transaction_count: snapshot.transaction_count,
+        }
+    }
+}
+
 /// Which read-mark, if any, currently protects this connection's snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReadGuardKind {
@@ -501,6 +514,11 @@ trait WalCoordination: Debug + Send + Sync {
 
     /// Load the current authoritative WAL snapshot.
     fn load_snapshot(&self) -> WalSnapshot;
+
+    /// Sample the WAL snapshot for read admission. None means publication is incomplete.
+    fn try_load_snapshot(&self) -> Option<WalSnapshot> {
+        Some(self.load_snapshot())
+    }
 
     /// Ensure any process-local fallback cache is complete for `snapshot`.
     fn ensure_local_frame_cache_covers(
@@ -1943,7 +1961,7 @@ impl ShmWalCoordination {
             return Ok(());
         }
 
-        let authority_snapshot = self.authority.snapshot();
+        let authority_snapshot = self.authority.try_snapshot().ok_or(LimboError::Busy)?;
         if authority_snapshot.checkpoint_seq != required_snapshot.checkpoint_seq {
             return Err(LimboError::Busy);
         }
@@ -1974,14 +1992,11 @@ impl WalCoordination for ShmWalCoordination {
     }
 
     fn load_snapshot(&self) -> WalSnapshot {
-        let snapshot = self.authority.snapshot();
-        WalSnapshot {
-            max_frame: snapshot.max_frame,
-            nbackfills: snapshot.nbackfills,
-            last_checksum: (snapshot.checksum_1, snapshot.checksum_2),
-            checkpoint_seq: snapshot.checkpoint_seq,
-            transaction_count: snapshot.transaction_count,
-        }
+        self.authority.snapshot().into()
+    }
+
+    fn try_load_snapshot(&self) -> Option<WalSnapshot> {
+        self.authority.try_snapshot().map(WalSnapshot::from)
     }
 
     fn ensure_local_frame_cache_covers(
@@ -2116,7 +2131,7 @@ impl WalCoordination for ShmWalCoordination {
         // See the in-process coordination: a checkpoint holding read-mark 0
         // must not make readers wait, so fall through to the other marks.
         if snapshot.max_frame == snapshot.nbackfills && read_locks[0].read() {
-            if self.load_snapshot() != snapshot {
+            if self.try_load_snapshot() != Some(snapshot) {
                 read_locks[0].unlock();
                 return None;
             }
@@ -2159,7 +2174,7 @@ impl WalCoordination for ShmWalCoordination {
         }
 
         let current_slot_mark = read_locks[best_idx as usize].get_value();
-        if current_slot_mark != best_mark || self.load_snapshot() != snapshot {
+        if current_slot_mark != best_mark || self.try_load_snapshot() != Some(snapshot) {
             read_locks[best_idx as usize].unlock();
             return None;
         }
@@ -2578,7 +2593,7 @@ impl ShmWalCoordination {
         );
         if (self.overlap_reader
             && (self.authority.frame_index_overflowed() || self.authority.checkpoint_lock_active()))
-            || self.load_snapshot() != snapshot
+            || self.try_load_snapshot() != Some(snapshot)
         {
             self.authority.unregister_reader_for_snapshot(reader);
             read_locks[read_lock_idx].unlock();
@@ -3459,7 +3474,13 @@ impl WalFile {
 
         // Snapshot the shared WAL state. We haven't taken a read lock yet, so we need
         // to validate these values later.
-        let shared_snapshot = self.load_coordination_snapshot();
+        let Some(shared_snapshot) = self.coordination.try_load_snapshot() else {
+            return if self.coordination.is_overlap_reader() {
+                TryBeginReadResult::Busy
+            } else {
+                TryBeginReadResult::Retry
+            };
+        };
         turso_assert!(
             shared_snapshot.nbackfills <= shared_snapshot.max_frame,
             "WAL snapshot cannot have backfills beyond max frame",
@@ -4907,23 +4928,24 @@ impl Wal for WalFile {
 
 impl WalFile {
     /// Build the reader's WAL without publishing or recovering shared state.
+    /// Return Busy if there is no stable snapshot.
     #[cfg(host_shared_wal)]
     pub(crate) fn new_overlap_reader(
         io: Arc<dyn IO>,
         shared: Arc<RwLock<WalFileShared>>,
         authority: Arc<MappedSharedWalCoordination>,
         buffer_pool: Arc<BufferPool>,
-    ) -> Self {
+    ) -> Result<Self> {
         let coordination = Arc::new(ShmWalCoordination::with_overlap_role(
             shared, authority, true,
         ));
-        let snapshot = coordination.load_snapshot();
-        Self::new_with_coordination(
+        let snapshot = coordination.try_load_snapshot().ok_or(LimboError::Busy)?;
+        Ok(Self::new_with_coordination(
             io,
             coordination,
             (snapshot.last_checksum, snapshot.max_frame),
             buffer_pool,
-        )
+        ))
     }
 
     #[cfg(host_shared_wal)]
@@ -6039,6 +6061,7 @@ impl WalFileShared {
     }
 
     /// Validate the shared snapshot before constructing the local WAL view.
+    /// An overlap open returns Busy when it cannot sample a stable snapshot.
     #[cfg(host_shared_wal)]
     fn open_shared_from_authority(
         io: &Arc<dyn IO>,
@@ -6049,7 +6072,11 @@ impl WalFileShared {
         overlap_pager: Option<&Pager>,
     ) -> Result<Arc<RwLock<WalFileShared>>> {
         let overlap_reader = overlap_pager.is_some();
-        let snapshot = authority.snapshot();
+        let snapshot = if overlap_reader {
+            authority.try_snapshot().ok_or(LimboError::Busy)?
+        } else {
+            authority.snapshot()
+        };
         let file = match io.open_file(path, flags, false) {
             Ok(file) => file,
             Err(LimboError::CompletionError(CompletionError::IOError(
@@ -6125,7 +6152,7 @@ impl WalFileShared {
             }
         }
         if overlap_reader
-            && (authority.checkpoint_lock_active() || authority.snapshot() != snapshot)
+            && (authority.checkpoint_lock_active() || authority.try_snapshot() != Some(snapshot))
         {
             return Err(LimboError::Busy);
         }

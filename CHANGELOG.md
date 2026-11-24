@@ -4,7 +4,7 @@
 
 ### 0.8.5
 
-* Embedded Rust databases can opt in to transferring encrypted WAL write ownership on 64-bit Linux. The authenticated successor opens the original files and the existing reader keeps its snapshot. The durable receipt supports cancellation before acceptance and exact activation retries. (EDEN-3907)
+* Embedded Rust databases can opt in to transferring encrypted WAL write ownership on 64-bit Linux. The authenticated successor opens the original files and the existing reader keeps its snapshot. New reads report a busy database while publication is incomplete. The durable receipt supports cancellation before acceptance and exact activation retries. (EDEN-3907)
 
 ### 0.8.4
 

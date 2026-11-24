@@ -3744,7 +3744,7 @@ impl Database {
                     self.shared_wal.clone(),
                     authority,
                     buffer_pool,
-                )));
+                )?));
             }
             return Ok(Arc::new(WalFile::new_with_shared_coordination(
                 self.io.clone(),

@@ -733,7 +733,7 @@ impl std::fmt::Debug for MappedSharedWalCoordination {
             .field("ownership_mode", &self.ownership_mode)
             .field("mapped_blocks", &mapped_blocks)
             .field("open_mode", &self.open_mode)
-            .field("snapshot", &self.snapshot())
+            .field("snapshot", &self.try_snapshot())
             .finish()
     }
 }
@@ -3251,18 +3251,44 @@ mod tests {
         ));
     }
 
-    /// Incomplete publication fences handoff and releases both mutation locks.
+    /// Incomplete publication fences handoff and fresh reads while the existing read stays registered.
     #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
     #[test]
     fn handoff_snapshot_refuses_interrupted_publication() {
+        use crate::storage::wal::{Wal, WalFile, WalFileShared};
+        use crate::BufferPool;
+
         let directory = tempfile::tempdir().expect("fixture directory");
-        let mapped = create_mapping(&directory.path().join("fixture.tshm"));
-        mapped.header().snapshot_seq.store(1, Ordering::Release);
-        assert!(matches!(
-            mapped.with_handoff_locks(|| mapped.try_snapshot().ok_or(LimboError::Busy)),
-            Err(LimboError::Busy)
-        ));
+        let mapped = Arc::new(create_mapping(&directory.path().join("fixture.tshm")));
+        let io = test_shared_wal_io();
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        let shared = WalFileShared::new_noop();
+        let reader = WalFile::new_overlap_reader(
+            io.clone(),
+            shared.clone(),
+            mapped.clone(),
+            buffer_pool.clone(),
+        )
+        .expect("open overlap reader before publication");
+        reader.begin_read_tx().expect("start read transaction");
+
+        mapped.with_snapshot_write(|_| {
+            assert!(matches!(
+                mapped.with_handoff_locks(|| mapped.try_snapshot().ok_or(LimboError::Busy)),
+                Err(LimboError::Busy)
+            ));
+            assert!(matches!(
+                WalFile::new_overlap_reader(io, shared, mapped.clone(), buffer_pool),
+                Err(LimboError::Busy)
+            ));
+            assert!(mapped.has_active_db_file_reader());
+            reader.end_read_tx();
+            assert!(matches!(reader.begin_read_tx(), Err(LimboError::Busy)));
+            assert!(!mapped.has_active_db_file_reader());
+        });
         assert!(!mapped.writer_or_checkpoint_lock_active());
+        reader.begin_read_tx().expect("publication is complete");
+        reader.end_read_tx();
     }
 
     #[test]
