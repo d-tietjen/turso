@@ -2262,6 +2262,7 @@ impl Database {
                                         flags,
                                         authority,
                                         &self.db_file,
+                                        encryption_key.map(|_| opening_pager.as_ref()),
                                     )?
                                 } else {
                                     WalFileShared::open_shared_if_exists(
@@ -2412,6 +2413,7 @@ impl Database {
                             flags,
                             authority,
                             &self.db_file,
+                            None,
                         )?
                     } else {
                         WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?

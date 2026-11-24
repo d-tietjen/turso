@@ -5675,13 +5675,13 @@ struct BackfillDatabaseIdentity {
     legacy_encoded_crc32c: Option<u32>,
 }
 
-/// Read a fresh page-one identity and authenticate the whole page for encrypted overlap.
+/// Read the main file's page-one identity, authenticating encrypted pages with the opening pager.
 fn read_database_identity_from_storage(
     io: &Arc<dyn IO>,
     db_file: &Arc<dyn DatabaseStorage>,
-    overlap_pager: Option<&Pager>,
+    encrypted_pager: Option<&Pager>,
 ) -> Result<Option<BackfillDatabaseIdentity>> {
-    let read_size = overlap_pager.map_or(PageSize::MIN as usize, |pager| {
+    let read_size = encrypted_pager.map_or(PageSize::MIN as usize, |pager| {
         pager.get_page_size_unchecked().get() as usize
     });
     let read_buf = Arc::new(Buffer::new_temporary(read_size));
@@ -5695,19 +5695,19 @@ fn read_database_identity_from_storage(
             None
         })
     });
-    let c = if let Some(pager) = overlap_pager {
+    let c = if let Some(pager) = encrypted_pager {
         db_file.read_page(DatabaseHeader::PAGE_ID, &pager.io_ctx.read(), read)?
     } else {
         db_file.read_header(read)?
     };
     io.wait_for_completion(c)?;
     let bytes_read = bytes_read.load(Ordering::Acquire);
-    if bytes_read < DatabaseHeader::SIZE || (overlap_pager.is_some() && bytes_read != read_size) {
+    if bytes_read < DatabaseHeader::SIZE || (encrypted_pager.is_some() && bytes_read != read_size) {
         return Ok(None);
     }
     let header = &read_buf.as_slice()[..DatabaseHeader::SIZE];
     let (db_size_pages, header_crc32c) = database_identity_from_header_bytes(header)?;
-    let legacy_encoded_crc32c = if let Some(pager) = overlap_pager {
+    let legacy_encoded_crc32c = if let Some(pager) = encrypted_pager {
         let context = pager.io_ctx.read();
         let encryption = context.encryption_context().ok_or(LimboError::NotADB)?;
         let encoded_magic = encryption.create_turso_header();
@@ -5864,6 +5864,7 @@ impl WalFileShared {
         )
     }
 
+    /// Open a normal WAL participant using the opening pager to authenticate encrypted backfill.
     #[cfg(host_shared_wal)]
     pub(crate) fn open_shared_from_authority_if_exists(
         io: &Arc<dyn IO>,
@@ -5871,8 +5872,17 @@ impl WalFileShared {
         flags: crate::OpenFlags,
         authority: &Arc<MappedSharedWalCoordination>,
         db_file: &Arc<dyn DatabaseStorage>,
+        encrypted_pager: Option<&Pager>,
     ) -> Result<Arc<RwLock<WalFileShared>>> {
-        Self::open_shared_from_authority(io, path, flags, authority, db_file, None)
+        Self::open_shared_from_authority(
+            io,
+            path,
+            flags,
+            authority,
+            db_file,
+            encrypted_pager,
+            false,
+        )
     }
 
     /// Use a validated live frame index and refuse opens that would need recovery.
@@ -5885,10 +5895,11 @@ impl WalFileShared {
         db_file: &Arc<dyn DatabaseStorage>,
         pager: &Pager,
     ) -> Result<Arc<RwLock<WalFileShared>>> {
-        Self::open_shared_from_authority(io, path, flags, authority, db_file, Some(pager))
+        Self::open_shared_from_authority(io, path, flags, authority, db_file, Some(pager), true)
     }
 
     /// Validate the shared snapshot before constructing the local WAL view.
+    /// Only an ordinary participant may recover when the snapshot cannot be reused.
     #[cfg(host_shared_wal)]
     fn open_shared_from_authority(
         io: &Arc<dyn IO>,
@@ -5896,9 +5907,9 @@ impl WalFileShared {
         flags: crate::OpenFlags,
         authority: &Arc<MappedSharedWalCoordination>,
         db_file: &Arc<dyn DatabaseStorage>,
-        overlap_pager: Option<&Pager>,
+        encrypted_pager: Option<&Pager>,
+        overlap_reader: bool,
     ) -> Result<Arc<RwLock<WalFileShared>>> {
-        let overlap_reader = overlap_pager.is_some();
         let snapshot = authority.snapshot();
         let file = match io.open_file(path, flags, false) {
             Ok(file) => file,
@@ -5953,7 +5964,7 @@ impl WalFileShared {
             return recover();
         }
         if snapshot.nbackfills != 0 {
-            let Some(identity) = read_database_identity_from_storage(io, db_file, overlap_pager)?
+            let Some(identity) = read_database_identity_from_storage(io, db_file, encrypted_pager)?
             else {
                 tracing::debug!(
                     nbackfills = snapshot.nbackfills,
@@ -8646,6 +8657,7 @@ pub mod test {
             crate::OpenFlags::Create,
             &reopened_authority,
             &open_test_db_file_for_wal(&io, &wal_path),
+            None,
         )
         .unwrap();
 
@@ -8693,6 +8705,7 @@ pub mod test {
             crate::OpenFlags::Create,
             &reopened_authority,
             &open_test_db_file_for_wal(&io, &wal_path),
+            None,
         )
         .unwrap();
         assert!(shared.read().runtime.frame_cache.lock().is_empty());
@@ -8761,6 +8774,7 @@ pub mod test {
             crate::OpenFlags::Create,
             &reopened_authority,
             &open_test_db_file_for_wal(&io, &wal_path),
+            None,
         )
         .unwrap();
 
@@ -8849,6 +8863,7 @@ pub mod test {
             crate::OpenFlags::Create,
             &authority,
             &open_test_db_file_for_wal(&io, &wal_path),
+            None,
         )
         .unwrap();
 
@@ -8886,6 +8901,7 @@ pub mod test {
             crate::OpenFlags::Create,
             &authority,
             &open_test_db_file_for_wal(&io, &wal_path),
+            None,
         )
         .unwrap();
         assert!(exclusive
@@ -8918,6 +8934,7 @@ pub mod test {
             crate::OpenFlags::Create,
             &reopened_authority,
             &open_test_db_file_for_wal(&io, &wal_path),
+            None,
         )
         .unwrap();
         assert!(!reopened_shared
@@ -8962,6 +8979,7 @@ pub mod test {
             crate::OpenFlags::Create,
             &authority,
             &open_test_db_file_for_wal(&io, &wal_path),
+            None,
         )
         .unwrap();
         assert!(shared
@@ -9023,6 +9041,7 @@ pub mod test {
             crate::OpenFlags::Create,
             &reopened_authority,
             &open_test_db_file_for_wal(&io, &wal_path),
+            None,
         )
         .unwrap();
 
@@ -9330,6 +9349,7 @@ pub mod test {
             crate::OpenFlags::Create,
             &reopened_authority,
             &open_test_db_file_for_wal(&io, &wal_path),
+            None,
         )
         .unwrap();
 
