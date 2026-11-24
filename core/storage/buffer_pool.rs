@@ -166,6 +166,11 @@ impl BufferPool {
         inner.get_db_page_buffer()
     }
 
+    /// Return the page size used for buffers from this database's pager.
+    pub(crate) fn database_page_size(&self) -> usize {
+        self.inner().get_db_page_size()
+    }
+
     /// Request a `Buffer` for use with a WAL frame,
     /// `[Database::page_size] + `WAL_FRAME_HEADER_SIZE`
     #[inline]

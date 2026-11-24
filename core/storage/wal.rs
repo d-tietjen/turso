@@ -690,7 +690,7 @@ pub trait Wal: Debug + Send + Sync {
     /// Whether shutdown checkpointing is valid when this process closes its last connection.
     fn should_checkpoint_on_close(&self) -> bool;
 
-    /// Find the latest frame containing a page.
+    /// Find the latest frame containing a page within the connection's pinned snapshot.
     ///
     /// optional frame_watermark parameter can be passed to force WAL to find frame not larger than watermark value
     /// caller must guarantee, that frame_watermark must be greater than last checkpointed frame, otherwise method will panic
@@ -3733,12 +3733,17 @@ impl Wal for WalFile {
         //
         // if it's not, than pages from WAL range [frame_watermark..nBackfill] are already in the DB file,
         // and in case if page first occurrence in WAL was after frame_watermark - we will be unable to read proper previous version of the page
-        let nbackfills = self.load_coordination_snapshot().nbackfills;
-        turso_assert!(
-            frame_watermark.is_none() || frame_watermark.unwrap() >= nbackfills,
-            "frame_watermark must be >= than current WAL backfill amount",
-            { "frame_watermark": frame_watermark, "nbackfills": nbackfills }
-        );
+        if let Some(frame_watermark) = frame_watermark {
+            let snapshot = self
+                .coordination
+                .try_load_snapshot()
+                .ok_or(LimboError::Busy)?;
+            turso_assert!(
+                frame_watermark >= snapshot.nbackfills,
+                "frame_watermark must be >= than current WAL backfill amount",
+                { "frame_watermark": frame_watermark, "nbackfills": snapshot.nbackfills }
+            );
+        }
 
         // A fully backfilled snapshot (max_frame < min_frame, that is
         // max_frame == nbackfills) has nothing visible in the WAL: read
@@ -3762,9 +3767,9 @@ impl Wal for WalFile {
             &self.io,
             WalSnapshot {
                 max_frame,
-                nbackfills: self.min_frame.load(Ordering::Acquire).saturating_sub(1),
+                nbackfills: min_frame.saturating_sub(1),
                 last_checksum: self.last_checksum(),
-                checkpoint_seq: self.coordination.wal_header().checkpoint_seq,
+                checkpoint_seq: self.checkpoint_seq.load(Ordering::Acquire),
                 transaction_count: self.transaction_count.load(Ordering::Acquire),
             },
         )?;
@@ -3789,7 +3794,7 @@ impl Wal for WalFile {
         Ok(frame)
     }
 
-    /// Read a frame from the WAL.
+    /// Read a WAL frame using the page size configured for the pager's read buffer.
     #[instrument(skip_all, level = Level::DEBUG)]
     fn read_frame(
         &self,
@@ -3803,7 +3808,7 @@ impl Wal for WalFile {
             page.get().id(),
             frame_id
         );
-        let offset = self.frame_offset(frame_id);
+        let offset = Self::frame_offset_for_page_size(frame_id, buffer_pool.database_page_size());
         page.set_locked();
         let frame = page.clone();
         let page_idx = page.get().id();
@@ -5047,8 +5052,12 @@ impl WalFile {
     }
 
     fn frame_offset(&self, frame_id: u64) -> u64 {
+        Self::frame_offset_for_page_size(frame_id, self.page_size() as usize)
+    }
+
+    fn frame_offset_for_page_size(frame_id: u64, page_size: usize) -> u64 {
         turso_assert_greater_than!(frame_id, 0, "Frame ID must be 1-based");
-        let page_offset = (frame_id - 1) * (self.page_size() + WAL_FRAME_HEADER_SIZE as u32) as u64;
+        let page_offset = (frame_id - 1) * (page_size + WAL_FRAME_HEADER_SIZE) as u64;
         WAL_HEADER_SIZE as u64 + page_offset
     }
 
@@ -7647,7 +7656,7 @@ pub mod test {
     }
 
     #[cfg(host_shared_wal)]
-    fn write_test_wal_with_single_commit_frame(
+    pub(in crate::storage) fn write_test_wal_with_single_commit_frame(
         io: &Arc<dyn IO>,
         wal_path: &std::path::Path,
     ) -> SharedWalCoordinationHeader {

@@ -3282,12 +3282,59 @@ mod tests {
                 Err(LimboError::Busy)
             ));
             assert!(mapped.has_active_db_file_reader());
+            assert_eq!(
+                reader.find_frame(1, None).expect("look up pinned page"),
+                None
+            );
             reader.end_read_tx();
             assert!(matches!(reader.begin_read_tx(), Err(LimboError::Busy)));
             assert!(!mapped.has_active_db_file_reader());
         });
         assert!(!mapped.writer_or_checkpoint_lock_active());
         reader.begin_read_tx().expect("publication is complete");
+        reader.end_read_tx();
+    }
+
+    /// A pinned WAL-backed reader can fetch an uncached page during an incomplete publication.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn handoff_snapshot_reads_pinned_wal_frame_during_publication() {
+        use crate::storage::wal::test::write_test_wal_with_single_commit_frame;
+        use crate::storage::wal::{Wal, WalFile, WalFileShared};
+        use crate::{BufferPool, OpenFlags, Page};
+
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let mapped = Arc::new(create_mapping(&directory.path().join("fixture.tshm")));
+        let io = test_shared_wal_io();
+        let wal_path = directory.path().join("fixture-wal");
+        let snapshot = write_test_wal_with_single_commit_frame(&io, &wal_path);
+        mapped.install_snapshot(snapshot);
+        mapped.record_frame(7, 1);
+        let shared = WalFileShared::open_shared_if_exists(
+            &io,
+            wal_path.to_str().expect("WAL path"),
+            OpenFlags::ReadOnly,
+        )
+        .expect("open fixture WAL");
+        let pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        pool.finalize_with_page_size(snapshot.page_size as usize)
+            .expect("configure fixture page size");
+        let reader = WalFile::new_overlap_reader(io.clone(), shared, mapped.clone(), pool.clone())
+            .expect("open overlap reader");
+        reader.begin_read_tx().expect("start pinned read");
+
+        mapped.with_snapshot_write(|_| {
+            let frame_id = reader
+                .find_frame(7, None)
+                .expect("look up pinned page")
+                .expect("page remains in the WAL");
+            let page = Arc::new(Page::new(7));
+            let read = reader
+                .read_frame(frame_id, page.clone(), pool, None)
+                .expect("read the uncached page");
+            io.wait_for_completion(read).expect("complete frame read");
+            assert_eq!(page.get_contents().as_ptr()[0], 0x5a);
+        });
         reader.end_read_tx();
     }
 
