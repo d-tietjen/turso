@@ -14,7 +14,9 @@ use std::path::Path;
 
 use rustix::fs::{self, AtFlags, FileType, Mode, OFlags};
 
-use crate::io::{unix_shared_wal_lock_byte, FileId, SharedWalLockKind};
+use crate::io::{
+    unix_shared_wal_lock_byte, unix_shared_wal_unlock_byte, FileId, SharedWalLockKind,
+};
 use crate::{io_error, EncryptedWalWriteBoundary, LimboError, Result};
 
 use super::shared_wal_coordination::{
@@ -128,14 +130,61 @@ struct Receipt {
     prepared: Option<PreparedTransfer>,
 }
 
-/// Exclusive lease for receipt access and writer lifetime. The OFD byte is
-/// released when the last reference to the dedicated file description closes.
+/// Exclusive lease for receipt access and writer lifetime.
+/// Dropping the lease unlocks its byte even if another reference to the file remains.
 pub(crate) struct WriterLease {
     directory: File,
     coordinator: File,
     backing_names: [OsString; 3],
     receipt_name: OsString,
     staging_name: OsString,
+}
+
+impl Drop for WriterLease {
+    fn drop(&mut self) {
+        release_handoff_byte(&self.coordinator, WRITER_LEASE_BYTE);
+    }
+}
+
+/// Hold one mutation byte only for the scoped handoff operation.
+struct MutationByte<'a> {
+    file: &'a File,
+    offset: u64,
+}
+
+impl<'a> MutationByte<'a> {
+    /// Acquire the byte without waiting for another writer or checkpointer.
+    fn acquire(file: &'a File, offset: u64) -> Result<Self> {
+        if !unix_shared_wal_lock_byte(
+            file.as_raw_fd(),
+            offset,
+            true,
+            false,
+            SharedWalLockKind::LinuxOfd,
+        )? {
+            return Err(LimboError::Busy);
+        }
+        Ok(Self { file, offset })
+    }
+}
+
+impl Drop for MutationByte<'_> {
+    fn drop(&mut self) {
+        release_handoff_byte(self.file, self.offset);
+    }
+}
+
+/// Release a handoff byte held by this exact open file description.
+fn release_handoff_byte(file: &File, offset: u64) {
+    if let Err(error) =
+        unix_shared_wal_unlock_byte(file.as_raw_fd(), offset, SharedWalLockKind::LinuxOfd)
+    {
+        tracing::warn!(
+            ?error,
+            offset,
+            "failed to unlock encrypted WAL handoff byte"
+        );
+    }
 }
 
 impl WriterLease {
@@ -197,8 +246,7 @@ impl WriterLease {
     }
 
     /// Exclude checkpoint and writer mutations on the reader's original coordinator.
-    /// Both locks are released with the temporary descriptor, including when
-    /// acquisition or the action fails.
+    /// Both bytes are unlocked when this method returns, including on acquisition or action failure.
     pub(crate) fn with_mutation_locks<T>(
         &mut self,
         reader_coordinator: FileId,
@@ -222,17 +270,8 @@ impl WriterLease {
         {
             return Err(invalid_backing());
         }
-        for offset in [CHECKPOINT_LOCK_OFFSET, WRITER_LOCK_OFFSET] {
-            if !unix_shared_wal_lock_byte(
-                lock_file.as_raw_fd(),
-                offset,
-                true,
-                false,
-                SharedWalLockKind::LinuxOfd,
-            )? {
-                return Err(LimboError::Busy);
-            }
-        }
+        let _checkpoint = MutationByte::acquire(&lock_file, CHECKPOINT_LOCK_OFFSET)?;
+        let _writer = MutationByte::acquire(&lock_file, WRITER_LOCK_OFFSET)?;
         action(self)
     }
 
@@ -949,6 +988,30 @@ mod tests {
         assert!(retry.verify_active(a, boundary).is_err());
         assert!(retry.rollback(a, transfer, boundary).is_err());
         assert!(retry.prepare(a, transfer, boundary, || {}).is_err());
+    }
+
+    #[test]
+    fn handoff_bytes_unlock_while_a_descriptor_copy_is_open() {
+        let directory = private_directory();
+        let path = directory.path().join(DB_NAME);
+        let (_db, _) = encrypted_boundary(&path);
+        let lease = WriterLease::acquire(&path).expect("acquire writer lease");
+        let copy = lease
+            .coordinator
+            .try_clone()
+            .expect("retain same description");
+        assert!(matches!(WriterLease::acquire(&path), Err(LimboError::Busy)));
+        drop(lease);
+        let successor = WriterLease::acquire(&path).expect("reacquire after logical release");
+
+        let checkpoint = MutationByte::acquire(&copy, CHECKPOINT_LOCK_OFFSET).expect("lock byte");
+        assert!(matches!(
+            MutationByte::acquire(&successor.coordinator, CHECKPOINT_LOCK_OFFSET),
+            Err(LimboError::Busy)
+        ));
+        drop(checkpoint);
+        let _checkpoint = MutationByte::acquire(&successor.coordinator, CHECKPOINT_LOCK_OFFSET)
+            .expect("reacquire with original description still open");
     }
 
     #[test]
