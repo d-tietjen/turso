@@ -3734,10 +3734,13 @@ impl Wal for WalFile {
         // if it's not, than pages from WAL range [frame_watermark..nBackfill] are already in the DB file,
         // and in case if page first occurrence in WAL was after frame_watermark - we will be unable to read proper previous version of the page
         if let Some(frame_watermark) = frame_watermark {
-            let snapshot = self
-                .coordination
-                .try_load_snapshot()
-                .ok_or(LimboError::Busy)?;
+            let snapshot = if self.coordination.is_overlap_reader() {
+                self.coordination
+                    .try_load_snapshot()
+                    .ok_or(LimboError::Busy)?
+            } else {
+                self.load_coordination_snapshot()
+            };
             turso_assert!(
                 frame_watermark >= snapshot.nbackfills,
                 "frame_watermark must be >= than current WAL backfill amount",
@@ -7148,7 +7151,7 @@ pub mod test {
     }
 
     #[test]
-    fn page_codec_round_trips_wal_batch_reads() {
+    fn page_codec_round_trips_wal_frame_and_batch_reads() {
         let page_size = 512;
         let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
         set_test_page_codec(&wal, Arc::new(TestPageCodec::Xor(0xa5)));
@@ -7157,6 +7160,13 @@ pub mod test {
             page_with_pattern(33, 0x20, &buffer_pool),
         ];
         let expected = append_test_pages(&io, &wal, page_size, &source_pages);
+
+        let second_page = Arc::new(crate::Page::new(33));
+        let read = wal
+            .read_frame(2, second_page.clone(), buffer_pool.clone(), None)
+            .expect("read uncached second frame");
+        io.wait_for_completion(read).expect("complete frame read");
+        assert_eq!(second_page.get_contents().as_ptr(), expected[1].as_slice());
 
         let target_pages = vec![
             Arc::new(crate::Page::new(32)),
