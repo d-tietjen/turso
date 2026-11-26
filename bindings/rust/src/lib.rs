@@ -334,6 +334,9 @@ impl Builder {
     /// Supply credentials using [`Self::with_encryption`]. A compatible coordinator
     /// with another live participant is required. The database and WAL are opened
     /// read-only. The reader does not create, recover, or checkpoint either file.
+    ///
+    /// If a writer rolls back flushed WAL frames, a fresh attachment may return
+    /// [`Error::Busy`]. Retry after the writer completes a truncating checkpoint.
     pub async fn build_encrypted_overlap_reader(self) -> Result<Database> {
         self.build_database(true).await
     }

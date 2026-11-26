@@ -95,6 +95,13 @@ async fn encrypted_overlap_reader_process() {
     let dir = std::env::var_os("TURSO_ENCRYPTED_OVERLAP_FIXTURE").expect("fixture directory");
     let dir = Path::new(&dir);
     let mode = std::env::var("TURSO_ENCRYPTED_OVERLAP_TEST_MODE").expect("test mode");
+    if mode == "rolled-back-spill" {
+        let result = encrypted_builder(&dir.join("overlap.db"), false)
+            .build_encrypted_overlap_reader()
+            .await;
+        assert!(matches!(result, Err(Error::Busy(_))));
+        return;
+    }
     if mode == "ordinary-passive-backfill" {
         let db = encrypted_builder(&dir.join("overlap.db"), false)
             .experimental_encryption(true)
@@ -386,4 +393,60 @@ async fn encrypted_overlap_refuses_fallback() {
         .expect("reader process")
         .success());
     assert!(!dir.path().join("overlap.db-tshm").exists());
+}
+
+/// Verify a fresh reader can retry after the writer checkpoints a rolled-back spill.
+#[tokio::test]
+async fn encrypted_overlap_retries_after_rolled_back_spill() {
+    let dir = tempfile::tempdir().expect("private fixture");
+    let data = dir.path().join("overlap.db");
+    let wal = dir.path().join("overlap.db-wal");
+    let writer = encrypted_builder(&data, false)
+        .experimental_encryption(true)
+        .experimental_multiprocess_wal(true)
+        .build()
+        .await
+        .expect("open writer");
+    let conn = writer.connect().expect("writer connection");
+    conn.execute("CREATE TABLE parent(value INTEGER)", ())
+        .await
+        .expect("schema");
+    assert_eq!(integer(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").await, 0);
+    conn.execute("INSERT INTO parent VALUES(31)", ())
+        .await
+        .expect("commit fixture row");
+    let committed_len = fs::metadata(&wal).expect("committed WAL").len();
+    conn.execute("BEGIN IMMEDIATE", ())
+        .await
+        .expect("begin write");
+    conn.execute("UPDATE parent SET value=99", ())
+        .await
+        .expect("stage update");
+    conn.cacheflush().expect("flush uncommitted frames");
+    let spilled_len = fs::metadata(&wal).expect("spilled WAL").len();
+    assert!(spilled_len > committed_len);
+    conn.execute("ROLLBACK", ())
+        .await
+        .expect("roll back spilled update");
+    assert_eq!(integer(&conn, "SELECT value FROM parent").await, 31);
+    assert_eq!(
+        fs::metadata(&wal).expect("retained WAL extent").len(),
+        spilled_len
+    );
+
+    let before = [&data, &wal].map(|p| fs::read(p).expect("retained bytes"));
+    assert!(reader_process(dir.path(), "rolled-back-spill")
+        .status()
+        .expect("fresh reader process")
+        .success());
+    let after = [&data, &wal].map(|p| fs::read(p).expect("retained bytes"));
+    assert_eq!(before, after, "retryable refusal changed the backing");
+
+    assert_eq!(integer(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").await, 0);
+    assert_eq!(fs::metadata(&wal).expect("settled WAL").len(), 0);
+    assert!(reader_process(dir.path(), "passive-backfill")
+        .status()
+        .expect("fresh reader after checkpoint")
+        .success());
+    assert_eq!(integer(&conn, "SELECT value FROM parent").await, 31);
 }
