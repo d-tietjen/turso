@@ -176,6 +176,39 @@ async fn encrypted_overlap_reader_process() {
     assert!(!output.exists());
 }
 
+#[tokio::test]
+#[ignore = "run by the overlap integration test in a separate process"]
+async fn encrypted_overlap_writer_contender_process() {
+    let dir = std::env::var_os("TURSO_ENCRYPTED_OVERLAP_FIXTURE").expect("fixture directory");
+    let dir = Path::new(&dir);
+    let db = encrypted_builder(&dir.join("overlap.db"), false)
+        .experimental_encryption(true)
+        .experimental_multiprocess_wal(true)
+        .build()
+        .await
+        .expect("attach ordinary writer contender before the transaction");
+    let conn = db.connect().expect("contender connection");
+    assert_eq!(integer(&conn, "SELECT value FROM parent").await, 31);
+    fs::write(dir.join("contender-attached"), b"").expect("signal contender attachment");
+
+    wait_for(&dir.join("writer-staged"));
+    assert!(matches!(
+        conn.execute("BEGIN IMMEDIATE", ()).await,
+        Err(Error::Busy(_))
+    ));
+    assert_eq!(integer(&conn, "SELECT value FROM parent").await, 31);
+    fs::write(dir.join("contender-busy"), b"").expect("signal writer contention");
+
+    wait_for(&dir.join("writer-committed"));
+    conn.execute("BEGIN IMMEDIATE", ())
+        .await
+        .expect("acquire the released writer lock");
+    assert_eq!(integer(&conn, "SELECT value FROM parent").await, 32);
+    conn.execute("ROLLBACK", ())
+        .await
+        .expect("release writer lock");
+}
+
 /// Verify one writer, committed read snapshots, checkpoint contention and durable reopen.
 #[tokio::test]
 async fn encrypted_overlap_preserves_snapshot_and_writer() {
@@ -241,6 +274,16 @@ async fn verify_overlap(with_wal_tail: bool) {
         "refused credentials changed a retained file"
     );
 
+    let mut contender = Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "encrypted_overlap_writer_contender_process",
+            "--ignored",
+        ])
+        .env("TURSO_ENCRYPTED_OVERLAP_FIXTURE", dir.path())
+        .spawn()
+        .expect("ordinary writer contender process");
+    wait_for(&dir.path().join("contender-attached"));
     let mut child = reader_process(dir.path(), "reader")
         .spawn()
         .expect("reader process");
@@ -270,6 +313,7 @@ async fn verify_overlap(with_wal_tail: bool) {
     let before_rollback = fs::read(&coordinator).expect("live coordinator");
     fs::write(dir.path().join("writer-staged"), b"").expect("allow reader rollback");
     wait_for(&dir.path().join("reader-rolled-back"));
+    wait_for(&dir.path().join("contender-busy"));
     assert_eq!(
         fs::read(&coordinator).expect("live coordinator"),
         before_rollback
@@ -287,6 +331,7 @@ async fn verify_overlap(with_wal_tail: bool) {
     let wal_retained = fs::metadata(&wal).expect("pinned WAL").len() > 0;
     fs::write(dir.path().join("writer-committed"), b"").expect("release reader");
     assert!(child.wait().expect("reap reader").success());
+    assert!(contender.wait().expect("reap writer contender").success());
     assert_eq!(checkpoint_busy, 1);
     assert!(wal_retained);
     assert_eq!(integer(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").await, 0);
