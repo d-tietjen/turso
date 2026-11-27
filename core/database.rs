@@ -3305,9 +3305,8 @@ impl Database {
                 })?;
                 Ok(boundary)
             })
-            .map(|boundary| {
+            .inspect(|_| {
                 writer.lease = None;
-                boundary
             })
     }
 

@@ -388,16 +388,10 @@ impl WriterLease {
         }
         match record.prepared {
             Some(pending)
-                if pending.request == transfer && pending.position == boundary.wal_position =>
-            {
-                ()
-            }
+                if pending.request == transfer && pending.position == boundary.wal_position => {}
             None if record
                 .resolved
-                .is_none_or(|finished| finished.request.id < transfer.id) =>
-            {
-                ()
-            }
+                .is_none_or(|finished| finished.request.id < transfer.id) => {}
             _ => return Err(stale_writer()),
         }
         record.resolved = Some(result);
