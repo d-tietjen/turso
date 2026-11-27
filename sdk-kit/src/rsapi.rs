@@ -932,7 +932,8 @@ impl TursoDatabase {
         Ok(())
     }
 
-    /// Reopen the existing encrypted database under its exact active writer claim.
+    /// Reopen the encrypted database and return its last resolved transfer ID
+    /// under the exact active writer claim.
     #[cfg(all(
         feature = "encrypted-wal-handoff",
         target_os = "linux",
@@ -942,10 +943,10 @@ impl TursoDatabase {
     pub fn resume_encrypted_wal_writer(
         config: TursoDatabaseConfig,
         claim: turso_core::WriterClaim,
-    ) -> Result<Arc<Self>, TursoError> {
+    ) -> Result<(Arc<Self>, Option<turso_core::TransferId>), TursoError> {
         Self::validate_encrypted_handoff_config(&config)?;
         let io = Self::open_vfs_io(&config)?;
-        let db = Database::resume_encrypted_wal_writer(
+        let (db, last_resolved_transfer) = Database::resume_encrypted_wal_writer(
             io,
             &config.path,
             OpenOptions::new(Arc::new(SqliteDialect))
@@ -954,7 +955,10 @@ impl TursoDatabase {
                 .encryption(config.encryption.clone()),
             claim,
         )?;
-        Ok(Self::from_admitted_writer(config, db))
+        Ok((
+            Self::from_admitted_writer(config, db),
+            last_resolved_transfer,
+        ))
     }
 
     /// Activate a writable successor using a connection from this overlap reader.

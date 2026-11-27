@@ -4,7 +4,7 @@
 
 ### 0.8.7
 
-* Embedded Rust databases can resume the current encrypted WAL writer after all participants exit. The explicit recovery call requires the original backing files, the correct encryption key, and the exact active writer claim at a verified committed boundary. (EDEN-4023)
+* Embedded Rust databases can resume the current encrypted WAL writer after all participants exit. The explicit recovery call requires the original backing files, the correct encryption key, and the exact active writer claim at a verified committed boundary. It returns the latest resolved transfer ID so the caller can choose a higher ID after restart. (EDEN-4023)
 
 ### 0.8.6
 

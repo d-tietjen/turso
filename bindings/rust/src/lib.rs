@@ -432,6 +432,16 @@ pub mod encrypted_wal_handoff {
     use super::{Builder, Connection, Database, EncryptedWalWriteBoundary, Result, TursoError};
     pub use turso_core::{TransferId, WriterClaim, WriterId, WriterTransfer};
 
+    /// Active writer recovered from the original encrypted files and receipt.
+    pub struct ResumedWriter {
+        /// The admitted database. Connections use the recovered writer.
+        pub database: Database,
+        /// The latest accepted or rolled-back transfer for this database.
+        /// The next transfer must use a higher ID. `None` means no transfer
+        /// has been resolved since enrollment.
+        pub last_resolved_transfer: Option<TransferId>,
+    }
+
     /// Enroll a quiescent native writer before allowing any successor to attach.
     /// The controller must already own the private backing and exclude other writers.
     pub fn enroll(database: &Database, owner: WriterId) -> Result<WriterClaim> {
@@ -447,12 +457,19 @@ pub mod encrypted_wal_handoff {
     /// Supply the original key and an absolute path to the existing database. This
     /// synchronous open requires every prior participant to have exited. It refuses
     /// stale claims, pending transfers, and an unproven committed WAL boundary.
-    pub fn resume(builder: Builder, claim: WriterClaim) -> Result<Database> {
-        let inner = turso_sdk_kit::rsapi::TursoDatabase::resume_encrypted_wal_writer(
-            builder.into_config(),
-            claim,
-        )?;
-        Ok(Database { inner })
+    ///
+    /// The returned transfer ID describes the verified database receipt. The
+    /// caller remains responsible for resolving operations outside this database.
+    pub fn resume(builder: Builder, claim: WriterClaim) -> Result<ResumedWriter> {
+        let (inner, last_resolved_transfer) =
+            turso_sdk_kit::rsapi::TursoDatabase::resume_encrypted_wal_writer(
+                builder.into_config(),
+                claim,
+            )?;
+        Ok(ResumedWriter {
+            database: Database { inner },
+            last_resolved_transfer,
+        })
     }
 
     /// Publish the exact boundary and fence the predecessor. A live writer or

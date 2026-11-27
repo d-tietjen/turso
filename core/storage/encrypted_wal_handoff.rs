@@ -399,18 +399,20 @@ impl WriterLease {
         self.publish(record)
     }
 
-    /// Confirm an active claim after recovering and validating its actual WAL.
-    /// Re-sync the directory before relying on a receipt left by a crash.
+    /// Confirm the active claim against the verified WAL and return the latest
+    /// accepted or rolled-back transfer ID. Re-sync the directory before
+    /// returning data from a receipt left by a crash.
     pub(crate) fn verify_active(
         &self,
         claim: WriterClaim,
         boundary: EncryptedWalWriteBoundary,
-    ) -> Result<()> {
+    ) -> Result<Option<TransferId>> {
         let record = self.verified_receipt(boundary)?;
         if record.claim != claim || record.prepared.is_some() {
             return Err(stale_writer());
         }
-        self.sync_directory()
+        self.sync_directory()?;
+        Ok(record.resolved.map(|resolved| resolved.request.id))
     }
 
     /// Match the still-prepared transfer and the successor's verified WAL boundary.
@@ -994,7 +996,10 @@ mod tests {
                 .expect("same accepted result"),
             b
         );
-        assert!(retry.verify_active(b, boundary).is_ok());
+        assert_eq!(
+            retry.verify_active(b, boundary).expect("active successor"),
+            Some(transfer.id)
+        );
         assert!(retry
             .accept(
                 WriterClaim {
@@ -1096,7 +1101,10 @@ mod tests {
         let request = transfer(3, owner(2));
         let staging = directory.path().join(&lease.staging_name);
         std::fs::write(&staging, b"incomplete record").expect("stage interrupted write");
-        assert!(lease.verify_active(a, boundary).is_ok());
+        assert_eq!(
+            lease.verify_active(a, boundary).expect("enrolled writer"),
+            None
+        );
         assert!(lease.accept(a, request, boundary).is_err());
         lease
             .prepare(a, request, boundary, || {})
@@ -1106,7 +1114,12 @@ mod tests {
             .rollback(a, request, boundary)
             .expect("roll back before acceptance");
         assert!(lease.rollback(a, request, boundary).is_ok());
-        assert!(lease.verify_active(a, boundary).is_ok());
+        assert_eq!(
+            lease
+                .verify_active(a, boundary)
+                .expect("writer after rollback"),
+            Some(request.id)
+        );
         assert!(lease.accept(a, request, boundary).is_err());
         assert!(lease.prepare(a, request, boundary, || {}).is_err());
         let next = transfer(4, owner(2));

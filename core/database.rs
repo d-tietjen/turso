@@ -64,8 +64,8 @@ use std::{fmt, ops::Deref};
 use storage::database::DatabaseFile;
 #[cfg(encrypted_wal_handoff)]
 use storage::encrypted_wal_handoff::{
-    self, ManagedWriter, PendingWriterTransfer, WritableWalBacking, WriterActivation, WriterClaim,
-    WriterId, WriterLease, WriterTransfer,
+    self, ManagedWriter, PendingWriterTransfer, TransferId, WritableWalBacking, WriterActivation,
+    WriterClaim, WriterId, WriterLease, WriterTransfer,
 };
 #[cfg(encrypted_wal_handoff)]
 use storage::shared_wal_coordination::ManagedWalMode;
@@ -3386,13 +3386,14 @@ impl Database {
 
     /// Resume the current claim on the original AES-256-GCM WAL after all participants exit.
     /// A pending transfer, another participant, or an unproven committed boundary refuses.
+    /// Return the last resolved transfer ID from the verified writer receipt with the writer.
     #[cfg(encrypted_wal_handoff)]
     pub fn resume_encrypted_wal_writer(
         io: Arc<dyn IO>,
         path: &str,
         options: OpenOptions,
         claim: WriterClaim,
-    ) -> Result<Arc<Self>> {
+    ) -> Result<(Arc<Self>, Option<TransferId>)> {
         let database_path = Path::new(path);
         if !io.supports_encrypted_wal_handoff()
             || !database_path.is_absolute()
@@ -3430,25 +3431,25 @@ impl Database {
         let wal = io::handoff_file(backing.wal, &wal_path);
         let encryption = options.encryption.as_ref().ok_or(LimboError::NotADB)?;
         let encryption_key = EncryptionKey::from_hex_string(&encryption.hexkey)?;
-        let boundary = lease.with_mutation_locks(authority.opened_file_id()?, |lease| {
-            let snapshot = authority.try_snapshot().ok_or(LimboError::Busy)?;
-            let boundary = EncryptedWalWriteBoundary {
-                database: database.opened_file_id()?,
-                wal: WalFileShared::verify_cold_handoff_boundary(
-                    &io,
-                    &database,
-                    &wal,
-                    &authority,
-                    snapshot,
-                    &encryption_key,
-                )?,
-                coordinator: authority.opened_file_id()?,
-                committed_frames: snapshot.max_frame,
-                wal_position: snapshot.encode(),
-            };
-            lease.verify_active(claim, boundary)?;
-            Ok(boundary)
-        })?;
+        let (boundary, last_resolved_transfer) =
+            lease.with_mutation_locks(authority.opened_file_id()?, |lease| {
+                let snapshot = authority.try_snapshot().ok_or(LimboError::Busy)?;
+                let boundary = EncryptedWalWriteBoundary {
+                    database: database.opened_file_id()?,
+                    wal: WalFileShared::verify_cold_handoff_boundary(
+                        &io,
+                        &database,
+                        &wal,
+                        &authority,
+                        snapshot,
+                        &encryption_key,
+                    )?,
+                    coordinator: authority.opened_file_id()?,
+                    committed_frames: snapshot.max_frame,
+                    wal_position: snapshot.encode(),
+                };
+                Ok((boundary, lease.verify_active(claim, boundary)?))
+            })?;
         let key = DatabaseKey::File(boundary.database);
         let opts = options
             .db_opts
@@ -3467,10 +3468,12 @@ impl Database {
         )?;
         lease.with_mutation_locks(authority.opened_file_id()?, |lease| {
             let verified = writer.encrypted_boundary_under_locks(&authority, false)?;
-            if verified != boundary {
+            if verified != boundary
+                || lease.verify_active(claim, verified)? != last_resolved_transfer
+            {
                 return Err(LimboError::Busy);
             }
-            lease.verify_active(claim, verified)
+            Ok(())
         })?;
         authority.with_handoff_locks(|| {
             let mut registry = DATABASE_MANAGER.lock();
@@ -3495,7 +3498,7 @@ impl Database {
             registry.insert(key, RegistryEntry::Ready(Arc::downgrade(&writer)));
             Ok(())
         })?;
-        Ok(writer)
+        Ok((writer, last_resolved_transfer))
     }
 
     /// Accept a handoff using an attached reader and return the new writer.

@@ -1280,14 +1280,30 @@ async fn cold_writer_process(dir: &Path, mode: &str) {
     let backing = dir.join("overlap.db");
     let (previous, request) = activation_request();
     if matches!(mode, "cold-resume-a" | "cold-resume-b") {
-        let (claim, committed) = if mode == "cold-resume-a" {
-            (previous, 35)
+        let (claim, committed, last_transfer) = if mode == "cold-resume-a" {
+            (previous, 35, None)
         } else {
-            (successor_claim(), 36)
+            (successor_claim(), 36, Some(10))
         };
-        let writer = handoff::resume(encrypted_builder(&backing, false), claim)
+        let recovered = handoff::resume(encrypted_builder(&backing, false), claim)
             .expect("resume original files without a live peer");
-        let conn = writer.connect().expect("resumed writer connection");
+        assert_eq!(
+            recovered
+                .last_resolved_transfer
+                .map(|transfer| transfer.0.get()),
+            last_transfer
+        );
+        if let Some(id) = recovered.last_resolved_transfer {
+            let stale = handoff::WriterTransfer {
+                id,
+                successor: previous.owner,
+            };
+            assert!(handoff::prepare(&recovered.database, stale).is_err());
+        }
+        let conn = recovered
+            .database
+            .connect()
+            .expect("resumed writer connection");
         assert_eq!(integer(&conn, "SELECT value FROM parent").await, committed);
         conn.execute("PRAGMA synchronous=FULL", ())
             .await
@@ -1313,7 +1329,7 @@ async fn cold_writer_process(dir: &Path, mode: &str) {
         let writer = handoff::activate(&database, &reader, previous, request).expect("accept as B");
         let conn = writer.connect().expect("accepted B connection");
         let later = handoff::WriterTransfer {
-            id: handoff::TransferId(NonZeroU128::new(2).expect("later sequence")),
+            id: handoff::TransferId(NonZeroU128::new(10).expect("later sequence")),
             successor: previous.owner,
         };
         handoff::prepare(&writer, later).expect("prepare a later transfer");
@@ -1435,9 +1451,15 @@ async fn managed_encrypted_writer_resumes_after_all_participants_exit() {
             assert!(Instant::now() < deadline, "resumed writer timed out");
             std::thread::sleep(Duration::from_millis(15));
         }
-        let writer = handoff::resume(encrypted_builder(&path, false), claim)
+        let recovered = handoff::resume(encrypted_builder(&path, false), claim)
             .expect("reopen resumed writer's durable change");
-        let conn = writer.connect().expect("connection");
+        assert_eq!(
+            recovered
+                .last_resolved_transfer
+                .map(|transfer| transfer.0.get()),
+            accepted.then_some(10)
+        );
+        let conn = recovered.database.connect().expect("connection");
         assert_eq!(
             integer(&conn, "SELECT value FROM parent").await,
             if accepted { 37 } else { 36 }
