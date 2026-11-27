@@ -519,9 +519,21 @@ impl QueryCase {
 }
 
 pub fn document(id: usize) -> (String, String) {
-    let rare = if id % 100 == 0 { "rare" } else { "plain" };
-    let alpha = if id % 2 == 0 { "alpha" } else { "gamma" };
-    let beta = if id % 3 == 0 { "beta" } else { "delta" };
+    let rare = if id.is_multiple_of(100) {
+        "rare"
+    } else {
+        "plain"
+    };
+    let alpha = if id.is_multiple_of(2) {
+        "alpha"
+    } else {
+        "gamma"
+    };
+    let beta = if id.is_multiple_of(3) {
+        "beta"
+    } else {
+        "delta"
+    };
     let prefix = if id % 200 == 100 {
         "rare common".to_string()
     } else {

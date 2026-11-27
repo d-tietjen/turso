@@ -102,7 +102,7 @@ impl InProcessServer {
             protocol: PullUpdatesProtocol::MvccLogical as i32,
         };
         let mut response = header.encode_length_delimited_to_vec();
-        for (page_id, page) in database.chunks_exact(PAGE_SIZE).enumerate() {
+        for (page_id, page) in database.as_chunks::<PAGE_SIZE>().0.iter().enumerate() {
             let page = PageData {
                 page_id: page_id as u64,
                 encoded_page: Bytes::copy_from_slice(page),

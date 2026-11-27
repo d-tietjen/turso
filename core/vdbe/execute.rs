@@ -4767,27 +4767,24 @@ pub fn op_transaction_inner(
                                     return Ok(state.suspend_on_io(io));
                                 }
                             }
-                            match begin_fresh_mvcc_tx(
-                                mv_store,
-                                &pager,
-                                &effective_mode,
-                                &conn,
-                                None,
-                            ) {
-                                Ok(tx_id) => {
-                                    conn.set_mv_tx_for_db(*db, Some((tx_id, effective_mode)));
-                                    started_secondary_tx = true;
-                                    if conn.get_auto_commit() && !conn.is_nested_stmt() {
-                                        state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
-                                    }
+                            {
+                                let tx_id = begin_fresh_mvcc_tx(
+                                    mv_store,
+                                    &pager,
+                                    &effective_mode,
+                                    &conn,
+                                    None,
+                                )?;
+                                conn.set_mv_tx_for_db(*db, Some((tx_id, effective_mode)));
+                                started_secondary_tx = true;
+                                if conn.get_auto_commit() && !conn.is_nested_stmt() {
+                                    state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                                 }
-                                Err(err) => return Err(err.into()),
                             }
-                        } else if write {
+                        } else if let (true, Some((tx_id, current_mode))) = (write, current_mv_tx) {
                             // Upgrade: attached DB has a Read/Concurrent tx but the
                             // statement needs write access. Mirror the main DB's
                             // upgrade logic so that exclusive locks are acquired.
-                            let (tx_id, current_mode) = current_mv_tx.unwrap();
                             if matches!(current_mode, TransactionMode::None | TransactionMode::Read)
                                 && matches!(tx_mode, TransactionMode::Write)
                             {
@@ -5795,7 +5792,9 @@ pub fn op_integer(
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[derive(Default)]
 pub enum OpProgramState {
+    #[default]
     Start,
     /// Step state tracks whether we're executing a trigger subprogram (vs FK action subprogram)
     Step {
@@ -5809,12 +5808,6 @@ pub enum OpProgramState {
         /// value becomes visible again once the trigger returns.
         saved_changes_value: Option<i64>,
     },
-}
-
-impl Default for OpProgramState {
-    fn default() -> Self {
-        Self::Start
-    }
 }
 
 fn finish_subprogram(
@@ -9823,18 +9816,18 @@ pub fn op_function(
             JsonFunc::Json => {
                 let json_value = &state.registers[*start_reg];
                 let json_str = get_json(json_value.get_value(), None);
-                match json_str {
-                    Ok(json) => state.registers[*dest].set_value(json),
-                    Err(e) => return Err(e.into()),
+                {
+                    let json = json_str?;
+                    state.registers[*dest].set_value(json)
                 }
             }
 
             JsonFunc::Jsonb => {
                 let json_value = &state.registers[*start_reg];
                 let json_blob = jsonb(json_value.get_value(), &state.json_cache);
-                match json_blob {
-                    Ok(json) => state.registers[*dest].set_value(json),
-                    Err(e) => return Err(e.into()),
+                {
+                    let json = json_blob?;
+                    state.registers[*dest].set_value(json)
                 }
             }
 
@@ -9854,9 +9847,9 @@ pub fn op_function(
                 };
                 let json_result = json_func(reg_values);
 
-                match json_result {
-                    Ok(json) => state.registers[*dest].set_value(json),
-                    Err(e) => return Err(e.into()),
+                {
+                    let json = json_result?;
+                    state.registers[*dest].set_value(json)
                 }
             }
             JsonFunc::JsonExtract => {
@@ -9872,9 +9865,9 @@ pub fn op_function(
                     }
                 };
 
-                match result {
-                    Ok(json) => state.registers[*dest].set_value(json),
-                    Err(e) => return Err(e.into()),
+                {
+                    let json = result?;
+                    state.registers[*dest].set_value(json)
                 }
             }
             JsonFunc::JsonbExtract => {
@@ -9890,9 +9883,9 @@ pub fn op_function(
                     }
                 };
 
-                match result {
-                    Ok(json) => state.registers[*dest].set_value(json),
-                    Err(e) => return Err(e.into()),
+                {
+                    let json = result?;
+                    state.registers[*dest].set_value(json)
                 }
             }
 
@@ -9906,9 +9899,9 @@ pub fn op_function(
                     _ => unreachable!(),
                 };
                 let json_str = json_func(json.get_value(), path.get_value(), &state.json_cache);
-                match json_str {
-                    Ok(json) => state.registers[*dest].set_value(json),
-                    Err(e) => return Err(e.into()),
+                {
+                    let json = json_str?;
+                    state.registers[*dest].set_value(json)
                 }
             }
             JsonFunc::JsonArrayLength | JsonFunc::JsonType => {
@@ -9930,16 +9923,16 @@ pub fn op_function(
                     _ => unreachable!(),
                 };
 
-                match func_result {
-                    Ok(result) => state.registers[*dest].set_value(result),
-                    Err(e) => return Err(e.into()),
+                {
+                    let result = func_result?;
+                    state.registers[*dest].set_value(result)
                 }
             }
             JsonFunc::JsonErrorPosition => {
                 let json_value = &state.registers[*start_reg];
-                match json_error_position(json_value.get_value()) {
-                    Ok(pos) => state.registers[*dest].set_value(pos),
-                    Err(e) => return Err(e.into()),
+                {
+                    let pos = json_error_position(json_value.get_value())?;
+                    state.registers[*dest].set_value(pos)
                 }
             }
             JsonFunc::JsonValid => {
@@ -10084,9 +10077,9 @@ pub fn op_function(
 
                 let json_result = json_set(reg_values, &state.json_cache);
 
-                match json_result {
-                    Ok(json) => state.registers[*dest].set_value(json),
-                    Err(e) => return Err(e.into()),
+                {
+                    let json = json_result?;
+                    state.registers[*dest].set_value(json)
                 }
             }
             JsonFunc::JsonbSet => {
@@ -10098,17 +10091,17 @@ pub fn op_function(
 
                 let json_result = jsonb_set(reg_values, &state.json_cache);
 
-                match json_result {
-                    Ok(json) => state.registers[*dest].set_value(json),
-                    Err(e) => return Err(e.into()),
+                {
+                    let json = json_result?;
+                    state.registers[*dest].set_value(json)
                 }
             }
             JsonFunc::JsonQuote => {
                 let json_value = &state.registers[*start_reg];
 
-                match json_quote(json_value.get_value()) {
-                    Ok(result) => state.registers[*dest].set_value(result),
-                    Err(e) => return Err(e.into()),
+                {
+                    let result = json_quote(json_value.get_value())?;
+                    state.registers[*dest].set_value(result)
                 }
             }
         },
@@ -10994,13 +10987,7 @@ pub fn op_function(
                             ScalarFunc::TestUintAdd => a.checked_add(b),
                             ScalarFunc::TestUintSub => a.checked_sub(b),
                             ScalarFunc::TestUintMul => a.checked_mul(b),
-                            ScalarFunc::TestUintDiv => {
-                                if b == 0 {
-                                    None
-                                } else {
-                                    Some(a / b)
-                                }
-                            }
+                            ScalarFunc::TestUintDiv => a.checked_div(b),
                             _ => unreachable!(),
                         };
                         match r {
@@ -17102,7 +17089,7 @@ pub fn op_rename_table(
 
         // Also update triggers on OTHER tables that reference the renamed table
         // in their body commands (e.g., INSERT INTO old_name in a trigger on another table)
-        for (_, triggers) in schema.triggers.iter_mut() {
+        for triggers in schema.triggers.values_mut() {
             for trigger_arc in triggers.iter_mut() {
                 if !sql_might_reference_identifier(&trigger_arc.sql, &normalized_from) {
                     continue;

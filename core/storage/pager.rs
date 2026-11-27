@@ -1123,16 +1123,20 @@ impl Page {
     /// Returns true if the pin count was decremented.
     #[inline]
     pub fn try_unpin(&self) -> bool {
-        self.get()
-            .pin_count
-            .fetch_update(Ordering::Release, Ordering::SeqCst, |current| {
-                if current == 0 {
-                    None
-                } else {
-                    Some(current - 1)
-                }
-            })
-            .is_ok()
+        let pin_count = &self.get().pin_count;
+        let mut current = pin_count.load(Ordering::SeqCst);
+        while let Some(next) = current.checked_sub(1) {
+            match pin_count.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Release,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+        false
     }
 
     /// Returns true if the page is pinned and thus not eligible for eviction from the page cache.
@@ -6694,7 +6698,6 @@ mod tests {
 mod ptrmap_tests {
     use crate::sync::Arc;
 
-    use super::ptrmap::*;
     use super::*;
     use crate::io::{MemoryIO, OpenFlags, IO};
     use crate::storage::buffer_pool::BufferPool;

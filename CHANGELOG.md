@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+* Restore strict stable Clippy checks for Turso 0.8.4 ([EDEN-4014](https://linear.app/edendev/issue/EDEN-4014)).
+
 ## 0.8.2 -- 2026-10-12
 
 ### Fixed

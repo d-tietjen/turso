@@ -104,15 +104,11 @@ mod cmath {
         pub fn atan2(x: f64, y: f64) -> f64;
     }
 
-    // SQLite's M_PI constant (same value as SQLite's func.c)
-    #[allow(clippy::excessive_precision)]
-    const M_PI: f64 = 3.141592653589793238462643383279502884;
-
     pub fn degrees(x: f64) -> f64 {
-        x * 180.0 / M_PI
+        x * 180.0 / std::f64::consts::PI
     }
     pub fn radians(x: f64) -> f64 {
-        x * M_PI / 180.0
+        x * std::f64::consts::PI / 180.0
     }
 }
 
@@ -174,10 +170,10 @@ fn first_nul(bytes: &[u8]) -> Option<usize> {
     const WORD_BYTES: usize = size_of::<usize>();
     const LOW_BITS: usize = usize::from_ne_bytes([0x01; WORD_BYTES]);
     const HIGH_BITS: usize = usize::from_ne_bytes([0x80; WORD_BYTES]);
-    let mut words = bytes.chunks_exact(WORD_BYTES);
+    let (words, remaining) = bytes.as_chunks::<WORD_BYTES>();
     let mut base = 0;
-    for word_bytes in words.by_ref() {
-        let word = usize::from_ne_bytes(word_bytes.try_into().unwrap());
+    for word_bytes in words {
+        let word = usize::from_ne_bytes(*word_bytes);
         // Subtracting LOW_BITS sets the high bit of each zero byte.
         // Masking with !word removes high bits set in the original word.
         // HIGH_BITS keeps only high bits; any bit left means a byte was zero.
@@ -186,11 +182,7 @@ fn first_nul(bytes: &[u8]) -> Option<usize> {
         }
         base += WORD_BYTES;
     }
-    words
-        .remainder()
-        .iter()
-        .position(|&b| b == 0)
-        .map(|i| base + i)
+    remaining.iter().position(|&b| b == 0).map(|i| base + i)
 }
 
 enum TrimType {
@@ -290,13 +282,14 @@ impl Value {
                 continue;
             }
 
-            let code = get_code(b);
-            if code.is_some() && code != prev_code {
-                result.push(code.unwrap());
-                prev_code = code;
-            } else if code.is_none() {
+            match get_code(b) {
+                Some(code) if Some(code) != prev_code => {
+                    result.push(code);
+                    prev_code = Some(code);
+                }
                 // Reset previous code for vowels/separators (a,e,i,o,u,y)
-                prev_code = None;
+                None => prev_code = None,
+                Some(_) => {}
             }
         }
 
@@ -1097,8 +1090,10 @@ impl Value {
 
         // In case of some functions and integer input, return the input as is
         if let Some(Numeric::Integer(i)) = v {
-            if matches! { function, MathFunc::Ceil | MathFunc::Ceiling | MathFunc::Floor | MathFunc::Trunc }
-            {
+            if matches!(
+                function,
+                MathFunc::Ceil | MathFunc::Ceiling | MathFunc::Floor | MathFunc::Trunc
+            ) {
                 return Value::from_i64(i);
             }
         }
@@ -1107,7 +1102,7 @@ impl Value {
             return Value::Null;
         };
 
-        if matches! { function, MathFunc::Ln | MathFunc::Log10 | MathFunc::Log2 } && f <= 0.0 {
+        if matches!(function, MathFunc::Ln | MathFunc::Log10 | MathFunc::Log2) && f <= 0.0 {
             return Value::Null;
         }
 
@@ -2219,7 +2214,7 @@ mod tests {
 
     #[test]
     fn test_exec_and() {
-        let inputs = vec![
+        let inputs = [
             (Value::from_i64(0), Value::Null),
             (Value::Null, Value::from_i64(1)),
             (Value::Null, Value::Null),

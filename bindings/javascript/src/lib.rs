@@ -10,7 +10,8 @@
 //! - Iterating through query results
 //! - Managing the I/O event loop
 
-#[cfg(feature = "browser")]
+/// Browser host I/O for WebAssembly builds.
+#[cfg(all(feature = "browser", target_family = "wasm"))]
 pub mod browser;
 
 use napi::bindgen_prelude::*;
@@ -380,14 +381,14 @@ impl Database {
         let io: Arc<dyn turso_core::IO> = if is_memory(&path) {
             Arc::new(turso_core::MemoryIO::new())
         } else {
-            #[cfg(not(feature = "browser"))]
+            #[cfg(not(all(feature = "browser", target_family = "wasm")))]
             {
                 Arc::new(
                     turso_core::PlatformIO::new()
                         .map_err(|e| to_generic_error("failed to create IO", e))?,
                 )
             }
-            #[cfg(feature = "browser")]
+            #[cfg(all(feature = "browser", target_family = "wasm"))]
             {
                 browser::opfs()
             }
@@ -1014,13 +1015,13 @@ fn to_js_value<'a>(
         }
         turso_core::Value::Text(s) => ToNapiValue::into_unknown(s.as_str(), env),
         turso_core::Value::Blob(b) => {
-            #[cfg(not(feature = "browser"))]
+            #[cfg(not(all(feature = "browser", target_family = "wasm")))]
             {
                 let buffer = Buffer::from(b.as_slice());
                 ToNapiValue::into_unknown(buffer, env)
             }
             // emnapi do not support Buffer
-            #[cfg(feature = "browser")]
+            #[cfg(all(feature = "browser", target_family = "wasm"))]
             {
                 let buffer = Uint8Array::from(b.as_slice());
                 ToNapiValue::into_unknown(buffer, env)

@@ -4668,14 +4668,14 @@ impl Wal for WalFile {
         let page_transform = self.io_ctx.read().page_transform().clone();
 
         // Rolling checksum input to each frame build
-        let mut next_frame_id = self.max_frame.load(Ordering::Acquire) + 1;
-        let mut rolling_checksum = if next_frame_id == 1 {
+        let first_frame_id = self.max_frame.load(Ordering::Acquire) + 1;
+        let mut rolling_checksum = if first_frame_id == 1 {
             (header.checksum_1, header.checksum_2)
         } else {
             self.last_checksum()
         };
         // Build every frame in order, updating the rolling checksum
-        for page in pages.iter() {
+        for (page, frame_id) in pages.iter().zip(first_frame_id..) {
             tracing::debug!("append_frames_vectored: page_id={}", page.get().id());
             let page_id = page.get().id();
             let plain = page.get_contents().as_ptr();
@@ -4694,11 +4694,10 @@ impl Wal for WalFile {
             iovecs.push(frame_bytes);
 
             // (page, assigned_frame_id, cumulative_checksum_at_this_frame)
-            page_frame_and_checksum.push((page.clone(), next_frame_id, new_checksum));
+            page_frame_and_checksum.push((page.clone(), frame_id, new_checksum));
 
             // Advance for the next frame
             rolling_checksum = new_checksum;
-            next_frame_id += 1;
         }
 
         let first_frame_id = self.max_frame.load(Ordering::Acquire) + 1;
@@ -5003,7 +5002,7 @@ impl WalFile {
                         .coordination
                         .iter_latest_frames(oc_min_frame, oc_max_frame);
                     // sort by frame_id for read locality
-                    to_checkpoint.sort_unstable_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
+                    to_checkpoint.sort_unstable_by_key(|a| (a.1, a.0));
                     // Every frame we are about to backfill must be durable in
                     // the WAL before it may be copied into the database file:
                     // commits under synchronous=NORMAL do not fsync the WAL,
@@ -6857,7 +6856,13 @@ pub mod test {
 
         let target_page = Arc::new(crate::Page::new(32));
         let completion = wal
-            .read_frames_batch(1, &[target_page.clone()], buffer_pool, None, None)
+            .read_frames_batch(
+                1,
+                std::slice::from_ref(&target_page),
+                buffer_pool,
+                None,
+                None,
+            )
             .unwrap();
         io.wait_for_completion(completion).unwrap();
         assert_eq!(target_page.get_contents().as_ptr(), expected.as_slice());

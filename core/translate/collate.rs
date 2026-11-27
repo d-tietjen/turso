@@ -23,9 +23,10 @@ use crate::{
 /// **Pre defined collation sequences**\
 /// Collating functions only matter when comparing string values.
 /// Numeric values are always compared numerically, and BLOBs are always compared byte-by-byte using memcmp().
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, PartialOrd, Ord, Default)]
 pub enum CollationSeq {
     Unset,
+    #[default]
     Binary,
     NoCase,
     Rtrim,
@@ -210,12 +211,6 @@ fn resolve_collation_name(
         return Ok(collation);
     }
     CollationSeq::new(collation)
-}
-
-impl Default for CollationSeq {
-    fn default() -> Self {
-        Self::Binary
-    }
 }
 
 impl std::fmt::Display for CollationSeq {
@@ -426,10 +421,10 @@ pub fn get_expr_collation_ctx_with_symbols(
                 }
                 return Ok(WalkControl::SkipChildren);
             }
-            Expr::Column { table, column, .. } => {
+            Expr::Column { table, column, .. }
                 // generated columns (the SELF_TABLE placeholder) don't inherit an implicit
                 // collation from their expression, so we skip them
-                if !table.is_self_table() {
+                if !table.is_self_table() => {
                     let (_, table_ref) = referenced_tables
                         .find_table_by_internal_id(*table)
                         .ok_or_else(|| {
@@ -442,7 +437,6 @@ pub fn get_expr_collation_ctx_with_symbols(
                         maybe_column_collseq = Some(column.collation());
                     }
                 }
-            }
             _ => {}
         }
         Ok(WalkControl::Continue)

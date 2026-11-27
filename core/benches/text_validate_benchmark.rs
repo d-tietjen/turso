@@ -109,7 +109,7 @@ fn fixture(content: Content, len: usize, offset: usize) -> Fixture {
         Content::UnicodeFirst => data[..2].copy_from_slice("é".as_bytes()),
         Content::UnicodeLast => data[len - 2..].copy_from_slice("é".as_bytes()),
         Content::UnicodeDense => {
-            for pair in data.chunks_exact_mut(2) {
+            for pair in data.as_chunks_mut::<2>().0 {
                 pair.copy_from_slice("é".as_bytes());
             }
         }

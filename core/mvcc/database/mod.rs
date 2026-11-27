@@ -10033,12 +10033,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 }
             }
 
-            if schema_rows_after.is_some() {
+            if let Some(schema_rows_after) = schema_rows_after {
                 // Now that all table and index ops from this transaction have
                 // been replayed, publish the frame's final schema. No later index
                 // op from this frame can observe a half-applied sqlite_schema.
-                let schema_rows_after =
-                    schema_rows_after.expect("schema_rows_after must exist when schema changed");
                 let schema_after = schema_after
                     .expect("schema_after must exist when frame_changes_schema is true");
                 schema_rows = schema_rows_after;
@@ -10362,18 +10360,28 @@ impl RowidAllocator {
     /// Initialize from btree max. Called once per table, under lock.
     pub fn initialize(&self, rowid: Option<i64>) {
         tracing::trace!("initialize({rowid:?})");
-        let _ = self
-            .max_rowid
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
-                let next = match rowid {
-                    // max_rowid starts at 0, but a B-tree whose largest rowid is
-                    // negative still needs to seed automatic allocation from that value.
-                    Some(rowid) if cur == 0 => rowid,
-                    Some(rowid) => cur.max(rowid),
-                    None => cur,
-                };
-                (next != cur).then_some(next)
-            });
+        let mut current = self.max_rowid.load(Ordering::SeqCst);
+        loop {
+            let next = match rowid {
+                // max_rowid starts at 0, but a B-tree whose largest rowid is
+                // negative still needs to seed automatic allocation from that value.
+                Some(rowid) if current == 0 => rowid,
+                Some(rowid) => current.max(rowid),
+                None => current,
+            };
+            if next == current {
+                break;
+            }
+            match self.max_rowid.compare_exchange_weak(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
         self.initialized.store(true, Ordering::SeqCst);
     }
 

@@ -1232,7 +1232,7 @@ pub fn translate_drop_index(
         } else {
             return Err(crate::error::LimboError::InvalidArgument(format!(
                 "No such index: {}",
-                &idx_name
+                idx_name
             )));
         }
     }

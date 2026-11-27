@@ -591,7 +591,7 @@ pub struct LogicalLog {
     /// Pending CRC from a deferred-offset write. Applied by
     /// `advance_offset_after_success` so that an abandoned write
     /// doesn't corrupt the chain.
-    #[cfg_attr(feature = "aristo-instr", inspect(name = "pending_running_crc"))]
+    #[cfg_attr(feature = "aristo-instr", inspect(ret = Option<u32>, with = |value| *value, name = "pending_running_crc"))]
     pending_running_crc: Option<u32>,
     pending_header_upgrade: Option<(LogHeader, Completion)>,
     encryption_ctx: Option<EncryptionContext>,

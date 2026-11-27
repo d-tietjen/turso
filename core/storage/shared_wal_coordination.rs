@@ -919,7 +919,7 @@ impl MappedSharedWalCoordination {
         ownership_mode: SharedWalOwnershipMode,
     ) -> Result<Self> {
         turso_assert!(
-            reader_slot_count >= 64 && reader_slot_count % 64 == 0,
+            reader_slot_count >= 64 && reader_slot_count.is_multiple_of(64),
             "reader_slot_count must be a non-zero multiple of 64"
         );
 
@@ -992,7 +992,7 @@ impl MappedSharedWalCoordination {
         ownership_mode: SharedWalOwnershipMode,
     ) -> Result<Option<Self>> {
         turso_assert!(
-            reader_slot_count >= 64 && reader_slot_count % 64 == 0,
+            reader_slot_count >= 64 && reader_slot_count.is_multiple_of(64),
             "reader_slot_count must be a non-zero multiple of 64"
         );
 
