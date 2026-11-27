@@ -2284,12 +2284,18 @@ impl Connection {
     /// If attempt to write frame at the position `frame_no` will create gap in the WAL - method will return error
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
+        if self.db.is_encrypted_overlap_reader() {
+            return Err(LimboError::ReadOnly);
+        }
         self.pager.load().wal_insert_frame(frame_no, frame)
     }
 
     /// Start WAL session by initiating read+write transaction for this connection
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_insert_begin(&self) -> Result<()> {
+        if self.db.is_encrypted_overlap_reader() {
+            return Err(LimboError::ReadOnly);
+        }
         let pager = self.pager.load();
         pager.begin_read_tx()?;
         // Sync-engine drives WAL maintenance explicitly: any auto-restart of
@@ -2318,6 +2324,9 @@ impl Connection {
     pub fn wal_insert_end(self: &Arc<Connection>, force_commit: bool) -> Result<()> {
         use crate::{return_if_io, types::IOResult};
 
+        if self.db.is_encrypted_overlap_reader() {
+            return Err(LimboError::ReadOnly);
+        }
         {
             let pager = self.pager.load();
 
@@ -2370,6 +2379,9 @@ impl Connection {
 
     /// Flush dirty pages to disk.
     pub fn cacheflush(&self) -> Result<Vec<Completion>> {
+        if self.db.is_encrypted_overlap_reader() {
+            return Err(LimboError::ReadOnly);
+        }
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
@@ -2380,6 +2392,9 @@ impl Connection {
     pub fn checkpoint(self: &Arc<Self>, mode: CheckpointMode) -> Result<CheckpointResult> {
         use crate::mvcc::database::CheckpointStateMachine;
         use crate::state_machine::{StateTransition, TransitionResult};
+        if self.db.is_encrypted_overlap_reader() {
+            return Err(LimboError::ReadOnly);
+        }
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }

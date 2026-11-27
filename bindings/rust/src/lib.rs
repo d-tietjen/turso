@@ -325,25 +325,46 @@ impl Builder {
     }
 
     /// Build the database.
-    #[allow(unused_variables, clippy::arc_with_non_send_sync)]
     pub async fn build(self) -> Result<Database> {
+        self.build_database(false).await
+    }
+
+    /// Attach a read-only AES-256-GCM reader to an existing shared WAL on 64-bit Linux.
+    ///
+    /// Supply credentials using [`Self::with_encryption`]. A compatible coordinator
+    /// with another live participant is required. The database and WAL are opened
+    /// read-only. The reader does not create, recover, or checkpoint either file.
+    ///
+    /// If a writer rolls back flushed WAL frames, a fresh attachment may return
+    /// [`Error::Busy`]. Retry after the writer completes a truncating checkpoint.
+    pub async fn build_encrypted_overlap_reader(self) -> Result<Database> {
+        self.build_database(true).await
+    }
+
+    /// Drive the asynchronous open for the requested database role.
+    #[allow(unused_variables, clippy::arc_with_non_send_sync)]
+    async fn build_database(self, encrypted_overlap: bool) -> Result<Database> {
         let features = self.build_features_string();
-        let db =
-            turso_sdk_kit::rsapi::TursoDatabase::new(turso_sdk_kit::rsapi::TursoDatabaseConfig {
-                path: self.path,
-                experimental_features: features,
-                async_io: true,
-                encryption: self.encryption_opts,
-                vfs: self.vfs,
-                io: self.io,
-                db_file: None,
-                page_codec: None,
-                open_flags: if self.read_only {
-                    turso_core::OpenFlags::ReadOnly
-                } else {
-                    turso_core::OpenFlags::default()
-                },
-            });
+        let config = turso_sdk_kit::rsapi::TursoDatabaseConfig {
+            path: self.path,
+            experimental_features: features,
+            async_io: true,
+            encryption: self.encryption_opts,
+            vfs: self.vfs,
+            io: self.io,
+            db_file: None,
+            page_codec: None,
+            open_flags: if self.read_only {
+                turso_core::OpenFlags::ReadOnly
+            } else {
+                turso_core::OpenFlags::default()
+            },
+        };
+        let db = if encrypted_overlap {
+            turso_sdk_kit::rsapi::TursoDatabase::new_encrypted_overlap_reader(config)?
+        } else {
+            turso_sdk_kit::rsapi::TursoDatabase::new(config)
+        };
         while let Some(io_c) = db.open()?.io() {
             // At this point IO must already be created
             let io = db

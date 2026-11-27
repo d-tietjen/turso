@@ -78,6 +78,8 @@ pub struct DatabaseOpts {
     pub enable_attach: bool,
     pub enable_generated_columns: bool,
     pub enable_multiprocess_wal: bool,
+    /// Require the existing shared WAL and restrict this database to an overlap reader.
+    encrypted_overlap_reader: bool,
     pub enable_without_rowid: bool,
     pub enable_experimental_mvcc_passive_checkpoint: bool,
     pub unsafe_testing: bool,
@@ -142,6 +144,16 @@ impl DatabaseOpts {
 
     pub fn with_multiprocess_wal(mut self, enable: bool) -> Self {
         self.enable_multiprocess_wal = enable;
+        self
+    }
+
+    /// Enable read-only AES-256-GCM overlap without recovery or coordinator creation.
+    /// Open the supplied storage with read-only flags on a native 64-bit Linux backend.
+    pub fn with_encrypted_overlap_reader(mut self) -> Self {
+        self.enable_multiprocess_wal = true;
+        self.enable_encryption = true;
+        self.enable_attach = false;
+        self.encrypted_overlap_reader = true;
         self
     }
 
@@ -751,6 +763,24 @@ impl Database {
             None
         };
 
+        if opts.encrypted_overlap_reader
+            && (!cfg!(all(
+                host_shared_wal,
+                target_os = "linux",
+                feature = "encryption"
+            )) || db_size == 0
+                || !flags.contains(OpenFlags::ReadOnly)
+                || flags.contains(OpenFlags::Create)
+                || !opts.enable_multiprocess_wal
+                || opts.enable_attach
+                || page_codec_id.is_some()
+                || encryption_cipher_mode != Some(CipherMode::Aes256Gcm))
+        {
+            return Err(LimboError::InvalidArgument(
+                "encrypted overlap requires an initialized read-only AES-256-GCM database".into(),
+            ));
+        }
+
         let init_page_1 = if db_size == 0 {
             let default_page_1 = pager::default_page1(encryption_cipher_mode.as_ref());
 
@@ -919,6 +949,16 @@ impl Database {
     }
 
     fn validate_open_options(options: &OpenOptions) -> Result<()> {
+        if options.db_opts.encrypted_overlap_reader
+            && (!options.flags.contains(OpenFlags::ReadOnly)
+                || options.flags.contains(OpenFlags::Create)
+                || options.wal_path.is_some()
+                || options.durable_storage.is_some())
+        {
+            return Err(LimboError::InvalidArgument(
+                "encrypted overlap requires read-only open with the database's existing WAL".into(),
+            ));
+        }
         Self::validate_external_page_codec_options(options.db_opts, options.page_codec.is_some())?;
         if options.encryption.is_some() && options.page_codec.is_some() {
             return Err(LimboError::InvalidArgument(
@@ -1134,6 +1174,7 @@ impl Database {
                 options.dialect.as_ref(),
                 options.page_codec.as_deref(),
             )? {
+                Self::reject_overlap_registry_reuse(options.db_opts, &db)?;
                 if options.durable_storage.is_some() && db.durable_storage.is_none() {
                     return Err(LimboError::InvalidArgument(
                         "database already open without custom durable storage; \
@@ -1204,6 +1245,16 @@ impl Database {
                 "OpenOptions::wal_path is only supported by Database::do_open/do_open_async, \
                  which skip the process-wide registry; the registry keys on the default WAL path"
                     .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Require an independently opened database and prevent changing its custody role.
+    fn reject_overlap_registry_reuse(opts: DatabaseOpts, db: &Self) -> Result<()> {
+        if opts.encrypted_overlap_reader || db.is_encrypted_overlap_reader() {
+            return Err(LimboError::InvalidArgument(
+                "encrypted overlap requires a separate database process".into(),
             ));
         }
         Ok(())
@@ -1289,6 +1340,7 @@ impl Database {
                     Some(RegistryEntry::Ready(weak)) => {
                         if let Some(db) = weak.upgrade() {
                             tracing::debug!("took database {path:?} from the registry");
+                            Self::reject_overlap_registry_reuse(options.db_opts, &db)?;
 
                             let db_is_encrypted =
                                 !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
@@ -1570,7 +1622,14 @@ impl Database {
                     state.conn = Some(conn);
                     state.schema_guard = Some(guard);
 
-                    state.phase = OpenDbAsyncPhase::ReadingHeader;
+                    state.phase = if opts.encrypted_overlap_reader {
+                        state
+                            .make_from_btree_state
+                            .read_schema_cookie_with_snapshot();
+                        OpenDbAsyncPhase::LoadingSchema
+                    } else {
+                        OpenDbAsyncPhase::ReadingHeader
+                    };
                 }
 
                 OpenDbAsyncPhase::ReadingHeader => {
@@ -1988,6 +2047,13 @@ impl Database {
                         })?,
                     );
 
+                    if self.is_encrypted_overlap_reader() && read_version != Version::Wal {
+                        return Err(LimboError::InvalidArgument(
+                            "encrypted overlap requires a WAL database".into(),
+                        )
+                        .into());
+                    }
+
                     // Validate fixed header fields per SQLite spec
                     if header_mut.max_embed_frac != 64 {
                         return Err(LimboError::Corrupt(format!(
@@ -2151,6 +2217,7 @@ impl Database {
                     };
                 }
                 HeaderValidationState::OpenWal {
+                    pager: opening_pager,
                     open_mv_store,
                     driver,
                     discarded_orphan_wal,
@@ -2179,13 +2246,23 @@ impl Database {
                             let flags = self.open_flags;
                             let shared_authority = self.open_shared_wal_coordination_for_open()?;
                             if let Some(authority) = shared_authority.as_ref() {
-                                if !authority.frame_index_overflowed() {
+                                if self.is_encrypted_overlap_reader() {
+                                    WalFileShared::open_shared_for_overlap(
+                                        &self.io,
+                                        &self.wal_path,
+                                        flags,
+                                        authority,
+                                        &self.db_file,
+                                        opening_pager,
+                                    )?
+                                } else if !authority.frame_index_overflowed() {
                                     WalFileShared::open_shared_from_authority_if_exists(
                                         &self.io,
                                         &self.wal_path,
                                         flags,
                                         authority,
                                         &self.db_file,
+                                        encryption_key.map(|_| opening_pager.as_ref()),
                                     )?
                                 } else {
                                     WalFileShared::open_shared_if_exists(
@@ -2223,6 +2300,9 @@ impl Database {
                     if shared_wal.read().last_checksum_and_max_frame().1 > 0
                         && self.db_file.size()? == 0
                     {
+                        if self.is_encrypted_overlap_reader() {
+                            return Err(LimboError::NotADB.into());
+                        }
                         turso_assert!(
                             !*discarded_orphan_wal,
                             "orphan WAL reopened with frames after being discarded"
@@ -2307,6 +2387,9 @@ impl Database {
     /// Rebuild the process-local shared WAL view after a caller restores the
     /// database and WAL files outside the pager.
     pub fn reload_wal_after_external_restore(self: &Arc<Self>) -> Result<()> {
+        if self.is_encrypted_overlap_reader() {
+            return Err(LimboError::ReadOnly);
+        }
         if self.page_codec_id.is_some() {
             return Err(LimboError::InvalidArgument(
                 "reloading a WAL after external restore is not supported with an external page codec"
@@ -2330,6 +2413,7 @@ impl Database {
                             flags,
                             authority,
                             &self.db_file,
+                            None,
                         )?
                     } else {
                         WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?
@@ -2630,6 +2714,11 @@ impl Database {
 
     pub fn is_readonly(&self) -> bool {
         self.open_flags.contains(OpenFlags::ReadOnly)
+    }
+
+    /// Whether this handle may read through a live shared WAL without owning mutations.
+    pub(crate) fn is_encrypted_overlap_reader(&self) -> bool {
+        self.opts.encrypted_overlap_reader
     }
 
     /// Non-blocking read of the 512-byte database file header (page 1's
@@ -2949,7 +3038,13 @@ impl Database {
         }
 
         let path = storage::wal::coordination_path_for_wal_path(&self.wal_path);
-        let authority = if self.open_flags.contains(OpenFlags::ReadOnly) {
+        let authority = if self.is_encrypted_overlap_reader() {
+            Arc::new(MappedSharedWalCoordination::open_existing_live(
+                &self.io,
+                Path::new(&path),
+                64,
+            )?)
+        } else if self.open_flags.contains(OpenFlags::ReadOnly) {
             let Some(authority) = MappedSharedWalCoordination::open_existing(
                 &self.io,
                 std::path::Path::new(&path),
@@ -3095,6 +3190,14 @@ impl Database {
     ) -> Result<Arc<dyn Wal>> {
         #[cfg(host_shared_wal)]
         if let Some(authority) = self.shared_wal_coordination()? {
+            if self.is_encrypted_overlap_reader() {
+                return Ok(Arc::new(WalFile::new_overlap_reader(
+                    self.io.clone(),
+                    self.shared_wal.clone(),
+                    authority,
+                    buffer_pool,
+                )));
+            }
             return Ok(Arc::new(WalFile::new_with_shared_coordination(
                 self.io.clone(),
                 self.shared_wal.clone(),

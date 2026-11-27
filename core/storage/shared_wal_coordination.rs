@@ -887,7 +887,34 @@ impl MappedSharedWalCoordination {
         path: &Path,
         reader_slot_count: u32,
     ) -> Result<Option<Self>> {
-        Self::open_existing_with_mode(io, path, reader_slot_count, Self::default_ownership_mode())
+        Self::open_existing_with_mode(
+            io,
+            path,
+            reader_slot_count,
+            Self::default_ownership_mode(),
+            false,
+        )
+    }
+
+    /// Join an existing Linux OFD lifetime lock without creating or repairing the mapping.
+    /// Keep the initialized writer alive through admission.
+    pub(crate) fn open_existing_live(
+        io: &Arc<dyn IO>,
+        path: &Path,
+        reader_slot_count: u32,
+    ) -> Result<Self> {
+        Self::open_existing_with_mode(
+            io,
+            path,
+            reader_slot_count,
+            SharedWalOwnershipMode::LinuxOfd,
+            true,
+        )?
+        .ok_or_else(|| {
+            LimboError::InvalidArgument(
+                "encrypted overlap requires an existing shared WAL coordinator".into(),
+            )
+        })
     }
 
     #[cfg(test)]
@@ -990,6 +1017,7 @@ impl MappedSharedWalCoordination {
         path: &Path,
         reader_slot_count: u32,
         ownership_mode: SharedWalOwnershipMode,
+        require_live_peer: bool,
     ) -> Result<Option<Self>> {
         turso_assert!(
             reader_slot_count >= 64 && reader_slot_count.is_multiple_of(64),
@@ -1012,7 +1040,21 @@ impl MappedSharedWalCoordination {
             Err(err) => return Err(err),
         };
         let lock_kind = Self::lock_kind_for_mode(ownership_mode);
-        let open_mode = Self::detect_open_mode(&file, lock_kind, base_len)?;
+        let open_mode = if require_live_peer {
+            // A failed Linux OFD upgrade preserves our shared lock and proves
+            // that a different open file description holds a conflicting lock.
+            if !file.shared_wal_try_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, lock_kind)? {
+                return Err(LimboError::Busy);
+            }
+            if file.shared_wal_try_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, true, lock_kind)? {
+                return Err(LimboError::InvalidArgument(
+                    "encrypted overlap requires a live shared WAL peer".into(),
+                ));
+            }
+            SharedWalCoordinationOpenMode::MultiProcess
+        } else {
+            Self::detect_open_mode(&file, lock_kind, base_len)?
+        };
         let metadata_len = file.size()? as usize;
         if metadata_len < base_len {
             file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
@@ -3076,6 +3118,50 @@ mod tests {
 
         let err = SharedWalCoordinationHeader::decode(&encoded).unwrap_err();
         assert!(matches!(err, LimboError::Corrupt(_)));
+    }
+
+    /// Check format refusal with the normal lifetime lock held on an independent descriptor.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn strict_attach_refuses_incompatible_live_coordinator() {
+        use std::os::unix::fs::FileExt;
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let path = directory.path().join("fixture.tshm");
+        let mapped = create_mapping(&path);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("fixture descriptor");
+        let version_offset = std::mem::offset_of!(SharedWalCoordinationMapHeader, version) as u64;
+        file.write_all_at(
+            &(SHARED_WAL_COORDINATION_VERSION + 1).to_ne_bytes(),
+            version_offset,
+        )
+        .expect("set incompatible fixture version");
+        let before = std::fs::read(&path).expect("staged bytes");
+        assert!(matches!(
+            MappedSharedWalCoordination::open_existing_live(&test_shared_wal_io(), &path, 64),
+            Err(LimboError::Corrupt(message)) if message.starts_with("unsupported shared WAL coordination map version")
+        ));
+        assert_eq!(std::fs::read(path).expect("retained bytes"), before);
+        drop(mapped);
+    }
+
+    /// An exclusive lifetime holder makes a strict open immediately busy.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn strict_attach_refuses_exclusive_lifetime_holder() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let path = directory.path().join("fixture.tshm");
+        let mapped = create_mapping(&path);
+        assert!(mapped
+            .file
+            .shared_wal_try_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, true, mapped.lock_kind(),)
+            .expect("take exclusive lifetime lock"));
+        assert!(matches!(
+            MappedSharedWalCoordination::open_existing_live(&test_shared_wal_io(), &path, 64),
+            Err(LimboError::Busy)
+        ));
     }
 
     #[test]

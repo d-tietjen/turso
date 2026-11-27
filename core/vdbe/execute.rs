@@ -669,6 +669,9 @@ pub fn op_checkpoint(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
+    if program.connection.db.is_encrypted_overlap_reader() {
+        return Err(LimboError::ReadOnly.into());
+    }
     fn set_not_in_wal_result(state: &mut ProgramState, dest: usize) {
         // Match SQLite for databases that are not in WAL mode.
         state.registers[dest].set_int(0);

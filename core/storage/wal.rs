@@ -488,6 +488,11 @@ enum CoordinationCheckpointGuardKind {
 
 /// Coordination operations that back the WAL's authoritative state.
 trait WalCoordination: Debug + Send + Sync {
+    /// Whether the handle is restricted to read snapshots.
+    fn is_overlap_reader(&self) -> bool {
+        false
+    }
+
     /// Load the current authoritative WAL snapshot.
     fn load_snapshot(&self) -> WalSnapshot;
 
@@ -1449,6 +1454,8 @@ struct ShmWalCoordination {
     /// Copied from `authority.owner_record()` at construction — all connections
     /// in the same process share the same owner identity.
     owner: SharedOwnerRecord,
+    /// Leave shared mutation custody with the existing writer.
+    overlap_reader: bool,
 }
 
 #[cfg(host_shared_wal)]
@@ -1500,6 +1507,15 @@ impl ShmWalCoordination {
         shared: Arc<RwLock<WalFileShared>>,
         authority: Arc<MappedSharedWalCoordination>,
     ) -> Self {
+        Self::with_overlap_role(shared, authority, false)
+    }
+
+    /// Use the validated reader snapshot locally or initialize ordinary writer state.
+    fn with_overlap_role(
+        shared: Arc<RwLock<WalFileShared>>,
+        authority: Arc<MappedSharedWalCoordination>,
+        overlap_reader: bool,
+    ) -> Self {
         let fallback = InProcessWalCoordination::new(shared.clone());
         let coordination = Self {
             shared,
@@ -1507,8 +1523,11 @@ impl ShmWalCoordination {
             owner: authority.owner_record(),
             authority,
             active_reader: Mutex::new(None),
+            overlap_reader,
         };
-        coordination.seed_or_sync_authority();
+        if !overlap_reader {
+            coordination.seed_or_sync_authority();
+        }
         coordination
     }
 
@@ -1929,6 +1948,10 @@ impl ShmWalCoordination {
 
 #[cfg(host_shared_wal)]
 impl WalCoordination for ShmWalCoordination {
+    fn is_overlap_reader(&self) -> bool {
+        self.overlap_reader
+    }
+
     fn load_snapshot(&self) -> WalSnapshot {
         let snapshot = self.authority.snapshot();
         WalSnapshot {
@@ -1945,6 +1968,9 @@ impl WalCoordination for ShmWalCoordination {
         io: &Arc<dyn IO>,
         snapshot: WalSnapshot,
     ) -> Result<()> {
+        if self.overlap_reader && self.authority.frame_index_overflowed() {
+            return Err(LimboError::Busy);
+        }
         self.ensure_local_frame_cache_covers_snapshot(io, snapshot)
     }
 
@@ -2024,8 +2050,9 @@ impl WalCoordination for ShmWalCoordination {
     ) -> Option<u64> {
         // Exhausting the reserved shared index space leaves the authority
         // incomplete. Fall back to the local scanned cache rather than trusting
-        // a truncated shared index.
-        if self.authority.frame_index_overflowed() {
+        // a truncated shared index. An overlap reader can still use the
+        // validated prefix of its pinned snapshot.
+        if self.authority.frame_index_overflowed() && !self.overlap_reader {
             return self
                 .fallback
                 .find_frame(page_id, min_frame, max_frame, frame_watermark);
@@ -2132,7 +2159,7 @@ impl WalCoordination for ShmWalCoordination {
     }
 
     fn try_begin_write_tx(&self) -> bool {
-        if !self.authority.try_acquire_writer(self.owner) {
+        if self.overlap_reader || !self.authority.try_acquire_writer(self.owner) {
             return false;
         }
         if !self.fallback.try_write_lock() {
@@ -2151,6 +2178,9 @@ impl WalCoordination for ShmWalCoordination {
         &self,
         mode: CheckpointMode,
     ) -> Result<CoordinationCheckpointGuardKind> {
+        if self.overlap_reader {
+            return Err(LimboError::ReadOnly);
+        }
         if !self.authority.try_acquire_checkpoint(self.owner) {
             return Err(LimboError::Busy);
         }
@@ -2200,6 +2230,10 @@ impl WalCoordination for ShmWalCoordination {
     fn acquire_vacuum_checkpoint_guard_from_held_lock(
         &self,
     ) -> Result<CoordinationCheckpointGuardKind> {
+        if self.overlap_reader {
+            self.fallback.unlock_checkpoint_lock();
+            return Err(LimboError::ReadOnly);
+        }
         if !self.authority.try_acquire_checkpoint(self.owner) {
             self.fallback.unlock_checkpoint_lock();
             return Err(LimboError::Busy);
@@ -2432,12 +2466,14 @@ impl WalCoordination for ShmWalCoordination {
 
     fn rollback_cache(&self, max_frame: u64) {
         self.fallback.rollback_cache(max_frame);
-        self.authority.rollback_frames(max_frame);
+        if !self.overlap_reader {
+            self.authority.rollback_frames(max_frame);
+        }
         self.clear_overflow_fallback_coverage();
     }
 
     fn should_checkpoint_on_close(&self) -> bool {
-        self.authority.is_last_process_mapping()
+        !self.overlap_reader && self.authority.is_last_process_mapping()
     }
 
     #[cfg(test)]
@@ -2515,7 +2551,10 @@ impl ShmWalCoordination {
             id = "reader_rechecks_snapshot_after_registration",
             parent = "checkpoint_safe_frame_below_every_reader"
         );
-        if self.load_snapshot() != snapshot {
+        if (self.overlap_reader
+            && (self.authority.frame_index_overflowed() || self.authority.checkpoint_lock_active()))
+            || self.load_snapshot() != snapshot
+        {
             self.authority.unregister_reader_for_snapshot(reader);
             read_locks[read_lock_idx].unlock();
             return false;
@@ -4231,6 +4270,10 @@ impl Wal for WalFile {
     #[instrument(skip_all, level = Level::DEBUG)]
 
     fn rollback(&self, rollback_to: Option<RollbackTo>) {
+        if self.coordination.is_overlap_reader() {
+            // Reader savepoints do not own any WAL frames.
+            return;
+        }
         let is_savepoint = rollback_to.is_some();
         let snapshot = self.load_coordination_snapshot();
         if let Some(r) = &rollback_to {
@@ -4301,6 +4344,9 @@ impl Wal for WalFile {
     }
 
     fn begin_vacuum_blocking_tx(&self) -> Result<()> {
+        if self.coordination.is_overlap_reader() {
+            return Err(LimboError::ReadOnly);
+        }
         turso_assert!(
             self.max_frame_read_lock_index.load(Ordering::Acquire) == NO_LOCK_HELD,
             "begin_vacuum_blocking_tx: must not already hold a read lock"
@@ -4403,6 +4449,9 @@ impl Wal for WalFile {
     }
 
     fn prepare_wal_start(&self, page_size: PageSize) -> Result<Option<Completion>> {
+        if self.coordination.is_overlap_reader() {
+            return Err(LimboError::ReadOnly);
+        }
         if self.coordination.wal_is_initialized() {
             return Ok(None);
         }
@@ -4787,6 +4836,26 @@ impl Wal for WalFile {
 }
 
 impl WalFile {
+    /// Build the reader's WAL without publishing or recovering shared state.
+    #[cfg(host_shared_wal)]
+    pub(crate) fn new_overlap_reader(
+        io: Arc<dyn IO>,
+        shared: Arc<RwLock<WalFileShared>>,
+        authority: Arc<MappedSharedWalCoordination>,
+        buffer_pool: Arc<BufferPool>,
+    ) -> Self {
+        let coordination = Arc::new(ShmWalCoordination::with_overlap_role(
+            shared, authority, true,
+        ));
+        let snapshot = coordination.load_snapshot();
+        Self::new_with_coordination(
+            io,
+            coordination,
+            (snapshot.last_checksum, snapshot.max_frame),
+            buffer_pool,
+        )
+    }
+
     #[cfg(host_shared_wal)]
     pub(crate) fn new_with_shared_coordination(
         io: Arc<dyn IO>,
@@ -5597,13 +5666,26 @@ pub(crate) fn database_identity_from_header_bytes(header_bytes: &[u8]) -> Result
     Ok((db_size_pages, header_crc32c))
 }
 
+/// Page-one identity used to validate the recorded backfill proof.
+struct BackfillDatabaseIdentity {
+    db_size_pages: u32,
+    header_crc32c: u32,
+    /// The v0.6 encrypted writer hashes the authenticated on-disk representation.
+    legacy_encoded_crc32c: Option<u32>,
+}
+
+/// Read the main file's page-one identity, authenticating encrypted pages with the opening pager.
 fn read_database_identity_from_storage(
     io: &Arc<dyn IO>,
     db_file: &Arc<dyn DatabaseStorage>,
-) -> Result<Option<(u32, u32)>> {
-    let read_buf = Arc::new(Buffer::new_temporary(PageSize::MIN as usize));
+    encrypted_pager: Option<&Pager>,
+) -> Result<Option<BackfillDatabaseIdentity>> {
+    let read_size = encrypted_pager.map_or(PageSize::MIN as usize, |pager| {
+        pager.get_page_size_unchecked().get() as usize
+    });
+    let read_buf = Arc::new(Buffer::new_temporary(read_size));
     let bytes_read = Arc::new(AtomicUsize::new(usize::MAX));
-    let c = db_file.read_header(Completion::new_read(read_buf.clone(), {
+    let read = Completion::new_read(read_buf.clone(), {
         let bytes_read = bytes_read.clone();
         Box::new(move |res| {
             if let Ok((_buf, count)) = res {
@@ -5611,14 +5693,37 @@ fn read_database_identity_from_storage(
             }
             None
         })
-    }))?;
+    });
+    let c = if let Some(pager) = encrypted_pager {
+        db_file.read_page(DatabaseHeader::PAGE_ID, &pager.io_ctx.read(), read)?
+    } else {
+        db_file.read_header(read)?
+    };
     io.wait_for_completion(c)?;
-    if bytes_read.load(Ordering::Acquire) < DatabaseHeader::SIZE {
+    let bytes_read = bytes_read.load(Ordering::Acquire);
+    if bytes_read < DatabaseHeader::SIZE || (encrypted_pager.is_some() && bytes_read != read_size) {
         return Ok(None);
     }
-    Ok(Some(database_identity_from_header_bytes(
-        &read_buf.as_slice()[..DatabaseHeader::SIZE],
-    )?))
+    let header = &read_buf.as_slice()[..DatabaseHeader::SIZE];
+    let (db_size_pages, header_crc32c) = database_identity_from_header_bytes(header)?;
+    let legacy_encoded_crc32c = if let Some(pager) = encrypted_pager {
+        let context = pager.io_ctx.read();
+        let encryption = context.encryption_context().ok_or(LimboError::NotADB)?;
+        let encoded_magic = encryption.create_turso_header();
+        // Decryption changes only the magic within the authenticated header.
+        // Reconstruct it from the same page, avoiding a second read across a checkpoint.
+        let mut encoded_header = [0; DatabaseHeader::SIZE];
+        encoded_header.copy_from_slice(header);
+        encoded_header[..encoded_magic.len()].copy_from_slice(&encoded_magic);
+        Some(crc32c::crc32c(&encoded_header))
+    } else {
+        None
+    };
+    Ok(Some(BackfillDatabaseIdentity {
+        db_size_pages,
+        header_crc32c,
+        legacy_encoded_crc32c,
+    }))
 }
 
 #[cfg(all(test, host_shared_wal))]
@@ -5758,6 +5863,7 @@ impl WalFileShared {
         )
     }
 
+    /// Open a normal WAL participant using the opening pager to authenticate encrypted backfill.
     #[cfg(host_shared_wal)]
     pub(crate) fn open_shared_from_authority_if_exists(
         io: &Arc<dyn IO>,
@@ -5765,6 +5871,43 @@ impl WalFileShared {
         flags: crate::OpenFlags,
         authority: &Arc<MappedSharedWalCoordination>,
         db_file: &Arc<dyn DatabaseStorage>,
+        encrypted_pager: Option<&Pager>,
+    ) -> Result<Arc<RwLock<WalFileShared>>> {
+        Self::open_shared_from_authority(
+            io,
+            path,
+            flags,
+            authority,
+            db_file,
+            encrypted_pager,
+            false,
+        )
+    }
+
+    /// Use a validated live frame index and refuse opens that would need recovery.
+    #[cfg(host_shared_wal)]
+    pub(crate) fn open_shared_for_overlap(
+        io: &Arc<dyn IO>,
+        path: &str,
+        flags: crate::OpenFlags,
+        authority: &Arc<MappedSharedWalCoordination>,
+        db_file: &Arc<dyn DatabaseStorage>,
+        pager: &Pager,
+    ) -> Result<Arc<RwLock<WalFileShared>>> {
+        Self::open_shared_from_authority(io, path, flags, authority, db_file, Some(pager), true)
+    }
+
+    /// Validate the shared snapshot before constructing the local WAL view.
+    /// Only an ordinary participant may recover when the snapshot cannot be reused.
+    #[cfg(host_shared_wal)]
+    fn open_shared_from_authority(
+        io: &Arc<dyn IO>,
+        path: &str,
+        flags: crate::OpenFlags,
+        authority: &Arc<MappedSharedWalCoordination>,
+        db_file: &Arc<dyn DatabaseStorage>,
+        encrypted_pager: Option<&Pager>,
+        overlap_reader: bool,
     ) -> Result<Arc<RwLock<WalFileShared>>> {
         let snapshot = authority.snapshot();
         let file = match io.open_file(path, flags, false) {
@@ -5772,28 +5915,30 @@ impl WalFileShared {
             Err(LimboError::CompletionError(CompletionError::IOError(
                 std::io::ErrorKind::NotFound,
                 _,
-            ))) if flags.contains(crate::OpenFlags::ReadOnly) => {
+            ))) if flags.contains(crate::OpenFlags::ReadOnly) && !overlap_reader => {
                 return Ok(WalFileShared::new_noop());
             }
             Err(e) => return Err(e),
         };
         let wal_size = file.size()?;
+        let recover = || {
+            if overlap_reader {
+                Err(LimboError::Busy)
+            } else {
+                sqlite3_ondisk::build_shared_wal(&file, io)
+            }
+        };
 
         match classify_authority_snapshot_against_wal(io, &file, snapshot)? {
             AuthoritySnapshotValidation::Trusted => {}
             AuthoritySnapshotValidation::RebuildFromDisk(reason) => {
-                tracing::debug!(
-                    ?reason,
-                    "rebuilding WAL state from disk because persisted authority is not provably reusable"
-                );
-                return sqlite3_ondisk::build_shared_wal(&file, io);
+                tracing::debug!(?reason, "rebuilding WAL state from disk because persisted authority is not provably reusable");
+                return recover();
             }
         }
         if authority.frame_index_overflowed() {
-            tracing::debug!(
-                "rebuilding WAL state from disk because the persisted tshm frame index is marked overflowed"
-            );
-            return sqlite3_ondisk::build_shared_wal(&file, io);
+            tracing::debug!("rebuilding WAL state from disk because the persisted tshm frame index is marked overflowed");
+            return recover();
         }
         if snapshot.nbackfills != 0
             && authority.open_mode() == SharedWalCoordinationOpenMode::Exclusive
@@ -5803,7 +5948,7 @@ impl WalFileShared {
                 max_frame = snapshot.max_frame,
                 "rebuilding WAL state from disk because an exclusive reopen must conservatively clear published backfill progress"
             );
-            return sqlite3_ondisk::build_shared_wal(&file, io);
+            return recover();
         }
         if snapshot.max_frame > snapshot.nbackfills
             && authority
@@ -5815,25 +5960,34 @@ impl WalFileShared {
                 nbackfills = snapshot.nbackfills,
                 "rebuilding WAL state from disk because the persisted tshm frame index has no entries for a visible WAL tail"
             );
-            return sqlite3_ondisk::build_shared_wal(&file, io);
+            return recover();
         }
         if snapshot.nbackfills != 0 {
-            let Some((db_size_pages, db_header_crc32c)) =
-                read_database_identity_from_storage(io, db_file)?
+            let Some(identity) = read_database_identity_from_storage(io, db_file, encrypted_pager)?
             else {
                 tracing::debug!(
                     nbackfills = snapshot.nbackfills,
                     "rebuilding WAL state from disk because the main database header is unavailable for backfill-proof validation"
                 );
-                return sqlite3_ondisk::build_shared_wal(&file, io);
+                return recover();
             };
-            if !authority.validate_backfill_proof(snapshot, db_size_pages, db_header_crc32c) {
+            let matches_proof = |crc32c| {
+                authority.validate_backfill_proof(snapshot, identity.db_size_pages, crc32c)
+            };
+            if !matches_proof(identity.header_crc32c)
+                && !identity.legacy_encoded_crc32c.is_some_and(matches_proof)
+            {
                 tracing::debug!(
                     nbackfills = snapshot.nbackfills,
                     "rebuilding WAL state from disk because persisted tshm backfill proof is not valid for the current database header"
                 );
-                return sqlite3_ondisk::build_shared_wal(&file, io);
+                return recover();
             }
+        }
+        if overlap_reader
+            && (authority.checkpoint_lock_active() || authority.snapshot() != snapshot)
+        {
+            return Err(LimboError::Busy);
         }
         let wal_is_initialized = wal_size >= WAL_HEADER_SIZE as u64;
 
@@ -8508,6 +8662,7 @@ pub mod test {
             crate::OpenFlags::Create,
             &reopened_authority,
             &open_test_db_file_for_wal(&io, &wal_path),
+            None,
         )
         .unwrap();
 
@@ -8555,6 +8710,7 @@ pub mod test {
             crate::OpenFlags::Create,
             &reopened_authority,
             &open_test_db_file_for_wal(&io, &wal_path),
+            None,
         )
         .unwrap();
         assert!(shared.read().runtime.frame_cache.lock().is_empty());
@@ -8623,6 +8779,7 @@ pub mod test {
             crate::OpenFlags::Create,
             &reopened_authority,
             &open_test_db_file_for_wal(&io, &wal_path),
+            None,
         )
         .unwrap();
 
@@ -8711,6 +8868,7 @@ pub mod test {
             crate::OpenFlags::Create,
             &authority,
             &open_test_db_file_for_wal(&io, &wal_path),
+            None,
         )
         .unwrap();
 
@@ -8748,6 +8906,7 @@ pub mod test {
             crate::OpenFlags::Create,
             &authority,
             &open_test_db_file_for_wal(&io, &wal_path),
+            None,
         )
         .unwrap();
         assert!(exclusive
@@ -8780,6 +8939,7 @@ pub mod test {
             crate::OpenFlags::Create,
             &reopened_authority,
             &open_test_db_file_for_wal(&io, &wal_path),
+            None,
         )
         .unwrap();
         assert!(!reopened_shared
@@ -8824,6 +8984,7 @@ pub mod test {
             crate::OpenFlags::Create,
             &authority,
             &open_test_db_file_for_wal(&io, &wal_path),
+            None,
         )
         .unwrap();
         assert!(shared
@@ -8885,6 +9046,7 @@ pub mod test {
             crate::OpenFlags::Create,
             &reopened_authority,
             &open_test_db_file_for_wal(&io, &wal_path),
+            None,
         )
         .unwrap();
 
@@ -9192,6 +9354,7 @@ pub mod test {
             crate::OpenFlags::Create,
             &reopened_authority,
             &open_test_db_file_for_wal(&io, &wal_path),
+            None,
         )
         .unwrap();
 

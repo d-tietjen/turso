@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### 0.8.5
+
+* Rust bindings can attach a read-only AES-256-GCM observer to an existing live multiprocess WAL on 64-bit Linux.
+* Ordinary encrypted multiprocess participants and read-only observers verify both legacy and current checkpoint proofs against an authenticated database page. (EDEN-3906)
+
 ### Fixed
 
 * Restore strict stable Clippy checks for Turso 0.8.4 ([EDEN-4014](https://linear.app/edendev/issue/EDEN-4014)).
