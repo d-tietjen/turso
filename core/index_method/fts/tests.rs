@@ -890,13 +890,18 @@ mod allocation_failures {
                 assert_eq!(crate::alloc::current_allocation_site(), Some(expected));
             }
             self.allocations.fetch_add(1, Ordering::Relaxed);
-            let previous =
-                self.remaining
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-                        (remaining >= 0).then(|| remaining - 1)
-                    });
-            if previous == Ok(0) {
-                return Err(AllocError);
+            let mut remaining = self.remaining.load(Ordering::Relaxed);
+            while remaining >= 0 {
+                match self.remaining.compare_exchange_weak(
+                    remaining,
+                    remaining - 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(0) => return Err(AllocError),
+                    Ok(_) => break,
+                    Err(observed) => remaining = observed,
+                }
             }
             Global.allocate(layout)
         }

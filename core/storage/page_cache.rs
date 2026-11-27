@@ -107,11 +107,11 @@ pub struct PageCache {
     /// Clock hand cursor for SIEVE eviction (pointer to an entry in the queue, or null)
     clock_hand: *mut PageCacheEntry,
     /// Threshold number of pages at which we start spilling dirty pages.
-    #[cfg_attr(feature = "aristo-instr", inspect)]
+    #[cfg_attr(feature = "aristo-instr", inspect(ret = usize, with = |value| *value))]
     spill_threshold: usize,
     spill_enabled: bool,
     /// Conservative estimation of pages that are evictable based on dirty/spilled state.
-    #[cfg_attr(feature = "aristo-instr", inspect)]
+    #[cfg_attr(feature = "aristo-instr", inspect(ret = usize, with = |value| *value))]
     evictable_count: usize,
 }
 
@@ -584,7 +584,7 @@ impl PageCache {
         const EST_SPILL: usize = 128;
         let mut spillable: Vec<PinGuard> = Vec::with_capacity(EST_SPILL);
 
-        for (_, &entry_ptr) in self.map.iter() {
+        for &entry_ptr in self.map.values() {
             let entry = unsafe { &*entry_ptr };
             let page = &entry.page;
             if Self::spillable(page) {

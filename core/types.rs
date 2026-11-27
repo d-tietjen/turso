@@ -127,8 +127,9 @@ pub(crate) fn is_ascii(data: &[u8]) -> bool {
     const HIGH_BITS: usize = usize::from_ne_bytes([0x80; WORD_BYTES]);
     if data.len() > 2 * WORD_BYTES {
         let mut folded = 0usize;
-        for bytes in data.chunks_exact(WORD_BYTES) {
-            folded |= usize::from_ne_bytes(bytes.try_into().unwrap());
+        let (words, _) = data.as_chunks::<WORD_BYTES>();
+        for &bytes in words {
+            folded |= usize::from_ne_bytes(bytes);
         }
         folded |= usize::from_ne_bytes(data[data.len() - WORD_BYTES..].try_into().unwrap());
         return folded & HIGH_BITS == 0;
@@ -822,7 +823,7 @@ impl Value {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ExternalAggState {
     pub context: usize,
     pub state: *mut AggCtx,
@@ -831,6 +832,26 @@ pub struct ExternalAggState {
     pub finalize_fn: FinalizeFunction,
     pub aggregate_destructor: Option<ContextDestructor>,
     pub value_destructor: Option<ValueDestructor>,
+}
+
+impl PartialEq for ExternalAggState {
+    fn eq(&self, other: &Self) -> bool {
+        self.context == other.context
+            && self.state == other.state
+            && self.argc == other.argc
+            && std::ptr::fn_addr_eq(self.step_fn, other.step_fn)
+            && std::ptr::fn_addr_eq(self.finalize_fn, other.finalize_fn)
+            && match (self.aggregate_destructor, other.aggregate_destructor) {
+                (Some(lhs), Some(rhs)) => std::ptr::fn_addr_eq(lhs, rhs),
+                (None, None) => true,
+                _ => false,
+            }
+            && match (self.value_destructor, other.value_destructor) {
+                (Some(lhs), Some(rhs)) => std::ptr::fn_addr_eq(lhs, rhs),
+                (None, None) => true,
+                _ => false,
+            }
+    }
 }
 
 /// Please use Display trait for all limbo output so we have single origin of truth
@@ -3134,11 +3155,10 @@ where
         }
     }
 
-    let mut field_idx = skip;
     let field_limit = right_unpacked.len().min(index_info.key_info.len());
 
     // assumes that that the `unpacked' iterator was not skipped outside this function call`
-    for rhs_value in right_unpacked.skip(skip) {
+    for (rhs_value, field_idx) in right_unpacked.skip(skip).zip(skip..) {
         let rhs_value = &rhs_value.as_value_ref();
         if field_idx >= field_limit || header_pos >= header_end {
             break;
@@ -3172,8 +3192,6 @@ where
         if final_comparison != std::cmp::Ordering::Equal {
             return Ok(final_comparison);
         }
-
-        field_idx += 1;
     }
 
     Ok(tie_breaker)

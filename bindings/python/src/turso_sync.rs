@@ -60,7 +60,7 @@ impl PyTursoPartialSyncOpts {
 /// Encryption cipher for Turso Cloud remote encryption.
 /// These match the server-side encryption settings.
 #[pyclass(eq, eq_int, from_py_object)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PyRemoteEncryptionCipher {
     Aes256Gcm,
     Aes128Gcm,
@@ -188,7 +188,8 @@ pub fn py_turso_sync_new(
     // calculate and set reserved_bytes from cipher if necessary
     let reserved_bytes = sync_config
         .remote_encryption_cipher
-        .map(|c| c.reserved_bytes())
+        .as_ref()
+        .map(PyRemoteEncryptionCipher::reserved_bytes)
         .or(sync_config.reserved_bytes);
     let sync_config = rsapi::TursoDatabaseSyncConfig {
         path: sync_config.path.clone(),
@@ -503,7 +504,7 @@ impl PyTursoSyncIoItem {
                                 tuples
                                     .push(PyTuple::new(py, [key.clone(), value.clone()])?.unbind());
                             }
-                            PyList::new(py, tuples.into_iter())?.unbind()
+                            PyList::new(py, tuples)?.unbind()
                         },
                     },
                 )?),

@@ -616,7 +616,9 @@ pub struct OpHashProbeState {
 // and RowId runs is one byte compare instead of a niche computation on a
 // nested payload.
 #[repr(u8)]
+#[derive(Default)]
 enum ActiveOpState {
+    #[default]
     None,
     ClearBtree(OpClearBtreeState),
     Delete(OpDeleteState),
@@ -695,12 +697,6 @@ macro_rules! active_state_accessor {
             }
         }
     };
-}
-
-impl Default for ActiveOpState {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl ActiveOpStateSlot {
@@ -846,16 +842,12 @@ pub(crate) struct DeferredSeekState {
     pub table_cursor_id: CursorID,
 }
 
+#[derive(Default)]
 pub(crate) enum VacuumOpState {
+    #[default]
     None,
     IntoFile(Box<VacuumIntoOpContext>),
     InPlace(Box<VacuumInPlaceOpContext>),
-}
-
-impl Default for VacuumOpState {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// The program state describes the environment in which the program executes.
@@ -1586,7 +1578,7 @@ impl ProgramState {
         self.has_stmt_transaction = false;
 
         // Drain attached pagers upfront so we can clean them up regardless of path.
-        let attached_pagers: Vec<Arc<Pager>> = self.attached_savepoint_pagers.drain(..).collect();
+        let attached_pagers: Vec<Arc<Pager>> = std::mem::take(&mut self.attached_savepoint_pagers);
         let result = match end_statement {
             EndStatement::ReleaseSavepoint => {
                 if let Some(mv_store) = connection.mv_store().as_ref() {
@@ -3036,10 +3028,7 @@ impl Program {
         }
 
         // Start/continue committing remaining attached MVCC transactions
-        loop {
-            let Some((db_id, tx_id, _mode)) = conn.next_attached_mv_tx() else {
-                break;
-            };
+        while let Some((db_id, tx_id, _mode)) = conn.next_attached_mv_tx() {
             let Some(attached_mv_store) = conn.mv_store_for_db(db_id) else {
                 conn.set_mv_tx_for_db(db_id, None);
                 continue;

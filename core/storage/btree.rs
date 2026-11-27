@@ -9959,7 +9959,7 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
     // loop in `process_cells` needs. Using unstable sort is fine as the
     // original order doesn't matter.
     if !is_physically_sorted {
-        cells.sort_unstable_by(|a, b| b.old_offset.cmp(&a.old_offset));
+        cells.sort_unstable_by_key(|cell| std::cmp::Reverse(cell.old_offset));
     }
 
     // Cells below the pointer array or overlapping each other mean the
@@ -11812,16 +11812,15 @@ mod tests {
     }
 
     fn rng_from_time_or_env() -> (ChaCha8Rng, u64) {
-        let seed = std::env::var("SEED").map_or(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis(),
-            |v| {
-                v.parse()
-                    .expect("Failed to parse SEED environment variable as u64")
-            },
-        );
+        let env_seed = std::env::var("SEED");
+        let clock_seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let seed = env_seed.map_or(clock_seed, |v| {
+            v.parse()
+                .expect("Failed to parse SEED environment variable as u64")
+        });
         let rng = ChaCha8Rng::seed_from_u64(seed as u64);
         (rng, seed as u64)
     }
@@ -14323,8 +14322,8 @@ mod tests {
             #[cfg(debug_assertions)]
             debug_validate_cells_core(contents, pager.usable_space());
             // check cells are correct
-            let mut cell_idx_cloned = if prefix { size } else { 0 };
-            for cell_idx in 0..contents.cell_count() {
+            let cloned_start = if prefix { size } else { 0 };
+            for (cell_idx, cell_idx_cloned) in (0..contents.cell_count()).zip(cloned_start..) {
                 let buf = contents.as_ptr();
                 let (start, len) = contents
                     .cell_get_raw_region(cell_idx, pager.usable_space())
@@ -14332,7 +14331,6 @@ mod tests {
                 let cell_in_page = &buf[start..start + len];
                 let cell_in_array = &cells_cloned[cell_idx_cloned];
                 assert_eq!(cell_in_page, cell_in_array);
-                cell_idx_cloned += 1;
             }
         }
     }
