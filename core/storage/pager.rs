@@ -3911,6 +3911,10 @@ impl Pager {
             .wal
             .as_ref()
             .ok_or_else(|| LimboError::InternalError("cacheflush() called without WAL".into()))?;
+        #[cfg(encrypted_wal_handoff)]
+        if wal.has_managed_writer() {
+            return Err(LimboError::ReadOnly.into());
+        }
         let page_sz = self.get_page_size().unwrap_or_default();
 
         loop {
@@ -5455,6 +5459,10 @@ impl Pager {
                     "checkpoint_shutdown() called on database without WAL".to_string(),
                 ));
             };
+            #[cfg(encrypted_wal_handoff)]
+            if wal.has_managed_writer() {
+                return Ok(());
+            }
             // fsync the wal syncronously before beginning checkpoint
             let c = wal.sync(self.get_sync_type())?;
             self.io.wait_for_completion(c)?;

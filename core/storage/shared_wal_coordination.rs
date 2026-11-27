@@ -23,6 +23,8 @@
 //! conservatism, never correctness: if the authority cannot prove a slot is
 //! dead, it must leave that slot in place.
 
+#[cfg(encrypted_wal_handoff)]
+use crate::sync::atomic::AtomicU8;
 use crate::{
     io::{Completion, File, FileSyncType, OpenFlags, SharedWalLockKind, SharedWalMappedRegion, IO},
     sync::{
@@ -54,9 +56,9 @@ const SHARED_WAL_COORDINATION_MAP_ALIGNMENT: usize = 4096;
 /// Byte 0: lifetime lock used only to detect whether another process is present.
 const PROCESS_LIFETIME_LOCK_OFFSET: u64 = 0;
 /// Byte 1: single-writer ownership byte.
-const WRITER_LOCK_OFFSET: u64 = 1;
+pub(super) const WRITER_LOCK_OFFSET: u64 = 1;
 /// Byte 2: single-checkpointer ownership byte.
-const CHECKPOINT_LOCK_OFFSET: u64 = 2;
+pub(super) const CHECKPOINT_LOCK_OFFSET: u64 = 2;
 /// Byte range starting at 3: one reader-byte lock per shared reader slot.
 const READER_LOCK_START_OFFSET: u64 = 3;
 /// Entries per frame-index block in the append-only shared page->frame index.
@@ -116,6 +118,17 @@ struct LocalLockState {
     writer_lock_held: bool,
     checkpoint_lock_held: bool,
     reader_locks: Vec<usize>,
+}
+
+/// Process-local admission state for an encrypted writer using a durable receipt.
+#[cfg(encrypted_wal_handoff)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum ManagedWalMode {
+    #[default]
+    Ordinary,
+    Active,
+    Fenced,
 }
 
 /// Per-connection ownership bookkeeping within a single process.
@@ -681,6 +694,9 @@ pub(crate) struct MappedSharedWalCoordination {
     process_local_ownership: Arc<Mutex<ProcessLocalOwnershipState>>,
     /// Per-mapping lock counts used to make `Drop` and stale probing precise.
     local_lock_state: Mutex<LocalLockState>,
+    /// Local writer permission changed only under both OFD mutation locks.
+    #[cfg(encrypted_wal_handoff)]
+    managed_mode: AtomicU8,
     open_mode: SharedWalCoordinationOpenMode,
     /// Whether exclusive open had to discard an invalid persisted backfill proof.
     sanitized_backfill_proof_on_open: bool,
@@ -717,7 +733,7 @@ impl std::fmt::Debug for MappedSharedWalCoordination {
             .field("ownership_mode", &self.ownership_mode)
             .field("mapped_blocks", &mapped_blocks)
             .field("open_mode", &self.open_mode)
-            .field("snapshot", &self.snapshot())
+            .field("snapshot", &self.try_snapshot())
             .finish()
     }
 }
@@ -751,6 +767,19 @@ type ProcessMappingResult = (
     Arc<Mutex<()>>,
     Arc<Mutex<ProcessLocalOwnershipState>>,
 );
+
+/// Holds both mutation locks in checkpoint-then-writer acquisition order.
+struct SharedWalHandoffLocks<'a> {
+    authority: &'a MappedSharedWalCoordination,
+}
+
+impl Drop for SharedWalHandoffLocks<'_> {
+    fn drop(&mut self) {
+        let owner = self.authority.owner_record();
+        self.authority.release_writer(owner);
+        self.authority.release_checkpoint(owner);
+    }
+}
 
 impl MappedSharedWalCoordination {
     const fn default_ownership_mode() -> SharedWalOwnershipMode {
@@ -802,6 +831,8 @@ impl MappedSharedWalCoordination {
                 checkpoint_lock_held: false,
                 reader_locks: vec![0; reader_slot_count as usize],
             }),
+            #[cfg(encrypted_wal_handoff)]
+            managed_mode: AtomicU8::new(ManagedWalMode::Ordinary as u8),
             open_mode,
             sanitized_backfill_proof_on_open: false,
             registry_path: None,
@@ -1237,33 +1268,71 @@ impl MappedSharedWalCoordination {
 
     /// Read a consistent snapshot of the shared coordination header.
     pub(crate) fn snapshot(&self) -> SharedWalCoordinationHeader {
-        let header = self.header();
         loop {
-            let seq_before = header.snapshot_seq.load(Ordering::Acquire);
-            if seq_before & 1 != 0 {
-                std::hint::spin_loop();
-                continue;
-            }
-            let snapshot = SharedWalCoordinationHeader {
-                max_frame: header.max_frame.load(Ordering::Acquire),
-                nbackfills: header.nbackfills.load(Ordering::Acquire),
-                transaction_count: header.transaction_count.load(Ordering::Acquire),
-                visibility_generation: header.visibility_generation.load(Ordering::Acquire),
-                checkpoint_seq: header.checkpoint_seq.load(Ordering::Acquire),
-                checkpoint_epoch: header.checkpoint_epoch.load(Ordering::Acquire),
-                page_size: header.page_size.load(Ordering::Acquire),
-                salt_1: header.salt_1.load(Ordering::Acquire),
-                salt_2: header.salt_2.load(Ordering::Acquire),
-                checksum_1: header.checksum_1.load(Ordering::Acquire),
-                checksum_2: header.checksum_2.load(Ordering::Acquire),
-                reader_slot_count: header.reader_slot_count,
-            };
-            let seq_after = header.snapshot_seq.load(Ordering::Acquire);
-            if seq_before == seq_after {
+            if let Some(snapshot) = self.try_snapshot() {
                 return snapshot;
             }
             std::hint::spin_loop();
         }
+    }
+
+    /// Sample the committed boundary once. Incomplete publication requires recovery.
+    #[inline]
+    pub(crate) fn try_snapshot(&self) -> Option<SharedWalCoordinationHeader> {
+        let header = self.header();
+        let seq_before = header.snapshot_seq.load(Ordering::Acquire);
+        if seq_before & 1 != 0 {
+            return None;
+        }
+        let snapshot = SharedWalCoordinationHeader {
+            max_frame: header.max_frame.load(Ordering::Acquire),
+            nbackfills: header.nbackfills.load(Ordering::Acquire),
+            transaction_count: header.transaction_count.load(Ordering::Acquire),
+            visibility_generation: header.visibility_generation.load(Ordering::Acquire),
+            checkpoint_seq: header.checkpoint_seq.load(Ordering::Acquire),
+            checkpoint_epoch: header.checkpoint_epoch.load(Ordering::Acquire),
+            page_size: header.page_size.load(Ordering::Acquire),
+            salt_1: header.salt_1.load(Ordering::Acquire),
+            salt_2: header.salt_2.load(Ordering::Acquire),
+            checksum_1: header.checksum_1.load(Ordering::Acquire),
+            checksum_2: header.checksum_2.load(Ordering::Acquire),
+            reader_slot_count: header.reader_slot_count,
+        };
+        let seq_after = header.snapshot_seq.load(Ordering::Acquire);
+        (seq_before == seq_after).then_some(snapshot)
+    }
+
+    /// Run a bounded transition under the actual writer and checkpoint locks.
+    pub(crate) fn with_handoff_locks<T>(&self, action: impl FnOnce() -> Result<T>) -> Result<T> {
+        let owner = self.owner_record();
+        if !self.try_acquire_checkpoint_inner(owner, true) {
+            return Err(LimboError::Busy);
+        }
+        if !self.try_acquire_writer_inner(owner, true) {
+            self.release_checkpoint(owner);
+            return Err(LimboError::Busy);
+        }
+        let _locks = SharedWalHandoffLocks { authority: self };
+        action()
+    }
+
+    /// Change local admission while holding both physical mutation locks.
+    #[cfg(encrypted_wal_handoff)]
+    pub(crate) fn set_managed_mode(&self, mode: ManagedWalMode) {
+        let local = self.local_lock_state.lock();
+        turso_assert!(local.writer_lock_held && local.checkpoint_lock_held);
+        self.managed_mode.store(mode as u8, Ordering::Release);
+    }
+
+    /// Whether this mapping belongs to a writer with a managed receipt.
+    #[cfg(encrypted_wal_handoff)]
+    pub(crate) fn managed(&self) -> bool {
+        self.managed_mode.load(Ordering::Acquire) != ManagedWalMode::Ordinary as u8
+    }
+
+    /// Identify the open coordination mapping independently of its current pathname.
+    pub(crate) fn opened_file_id(&self) -> Result<crate::io::FileId> {
+        self.file.opened_file_id()
     }
 
     pub(crate) const fn open_mode(&self) -> SharedWalCoordinationOpenMode {
@@ -1757,7 +1826,16 @@ impl MappedSharedWalCoordination {
 
     /// Attempt to acquire the writer lock for this mapping.
     pub(crate) fn try_acquire_writer(&self, owner: SharedOwnerRecord) -> bool {
+        self.try_acquire_writer_inner(owner, false)
+    }
+
+    /// Acquire the real writer byte, optionally for a local receipt transition.
+    fn try_acquire_writer_inner(&self, owner: SharedOwnerRecord, _handoff: bool) -> bool {
         let mut local = self.local_lock_state.lock();
+        #[cfg(encrypted_wal_handoff)]
+        if !_handoff && self.managed_mode.load(Ordering::Relaxed) == ManagedWalMode::Fenced as u8 {
+            return false;
+        }
         if local.writer_lock_held {
             return false;
         }
@@ -1884,7 +1962,16 @@ impl MappedSharedWalCoordination {
 
     /// Attempt to acquire the checkpoint lock for this mapping.
     pub(crate) fn try_acquire_checkpoint(&self, owner: SharedOwnerRecord) -> bool {
+        self.try_acquire_checkpoint_inner(owner, false)
+    }
+
+    /// Acquire the real checkpoint byte, optionally for a local receipt transition.
+    fn try_acquire_checkpoint_inner(&self, owner: SharedOwnerRecord, _handoff: bool) -> bool {
         let mut local = self.local_lock_state.lock();
+        #[cfg(encrypted_wal_handoff)]
+        if !_handoff && self.managed_mode.load(Ordering::Relaxed) == ManagedWalMode::Fenced as u8 {
+            return false;
+        }
         if local.checkpoint_lock_held {
             return false;
         }
@@ -3162,6 +3249,93 @@ mod tests {
             MappedSharedWalCoordination::open_existing_live(&test_shared_wal_io(), &path, 64),
             Err(LimboError::Busy)
         ));
+    }
+
+    /// Incomplete publication fences handoff and fresh reads while the existing read stays registered.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn handoff_snapshot_refuses_interrupted_publication() {
+        use crate::storage::wal::{Wal, WalFile, WalFileShared};
+        use crate::BufferPool;
+
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let mapped = Arc::new(create_mapping(&directory.path().join("fixture.tshm")));
+        let io = test_shared_wal_io();
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        let shared = WalFileShared::new_noop();
+        let reader = WalFile::new_overlap_reader(
+            io.clone(),
+            shared.clone(),
+            mapped.clone(),
+            buffer_pool.clone(),
+        )
+        .expect("open overlap reader before publication");
+        reader.begin_read_tx().expect("start read transaction");
+
+        mapped.with_snapshot_write(|_| {
+            assert!(matches!(
+                mapped.with_handoff_locks(|| mapped.try_snapshot().ok_or(LimboError::Busy)),
+                Err(LimboError::Busy)
+            ));
+            assert!(matches!(
+                WalFile::new_overlap_reader(io, shared, mapped.clone(), buffer_pool),
+                Err(LimboError::Busy)
+            ));
+            assert!(mapped.has_active_db_file_reader());
+            assert_eq!(
+                reader.find_frame(1, None).expect("look up pinned page"),
+                None
+            );
+            reader.end_read_tx();
+            assert!(matches!(reader.begin_read_tx(), Err(LimboError::Busy)));
+            assert!(!mapped.has_active_db_file_reader());
+        });
+        assert!(!mapped.writer_or_checkpoint_lock_active());
+        reader.begin_read_tx().expect("publication is complete");
+        reader.end_read_tx();
+    }
+
+    /// A pinned WAL-backed reader can fetch an uncached page during an incomplete publication.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn handoff_snapshot_reads_pinned_wal_frame_during_publication() {
+        use crate::storage::wal::test::write_test_wal_with_single_commit_frame;
+        use crate::storage::wal::{Wal, WalFile, WalFileShared};
+        use crate::{BufferPool, OpenFlags, Page};
+
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let mapped = Arc::new(create_mapping(&directory.path().join("fixture.tshm")));
+        let io = test_shared_wal_io();
+        let wal_path = directory.path().join("fixture-wal");
+        let snapshot = write_test_wal_with_single_commit_frame(&io, &wal_path);
+        mapped.install_snapshot(snapshot);
+        mapped.record_frame(7, 1);
+        let shared = WalFileShared::open_shared_if_exists(
+            &io,
+            wal_path.to_str().expect("WAL path"),
+            OpenFlags::ReadOnly,
+        )
+        .expect("open fixture WAL");
+        let pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        pool.finalize_with_page_size(snapshot.page_size as usize)
+            .expect("configure fixture page size");
+        let reader = WalFile::new_overlap_reader(io.clone(), shared, mapped.clone(), pool.clone())
+            .expect("open overlap reader");
+        reader.begin_read_tx().expect("start pinned read");
+
+        mapped.with_snapshot_write(|_| {
+            let frame_id = reader
+                .find_frame(7, None)
+                .expect("look up pinned page")
+                .expect("page remains in the WAL");
+            let page = Arc::new(Page::new(7));
+            let read = reader
+                .read_frame(frame_id, page.clone(), pool, None)
+                .expect("read the uncached page");
+            io.wait_for_completion(read).expect("complete frame read");
+            assert_eq!(page.get_contents().as_ptr()[0], 0x5a);
+        });
+        reader.end_read_tx();
     }
 
     #[test]

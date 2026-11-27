@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### 0.8.6
+
+* Embedded Rust databases can opt in to transferring encrypted WAL write ownership on 64-bit Linux. The authenticated successor opens the original files and the existing reader keeps its snapshot. New reads report a busy database while publication is incomplete. The durable receipt supports cancellation before acceptance and exact activation retries. (EDEN-3907)
+
 ### 0.8.5
 
 * Rust bindings can attach a read-only AES-256-GCM observer to an existing live multiprocess WAL on 64-bit Linux.

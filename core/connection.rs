@@ -2284,7 +2284,7 @@ impl Connection {
     /// If attempt to write frame at the position `frame_no` will create gap in the WAL - method will return error
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
-        if self.db.is_encrypted_overlap_reader() {
+        if self.db.is_encrypted_overlap_reader() || self.db.is_managed_wal_writer() {
             return Err(LimboError::ReadOnly);
         }
         self.pager.load().wal_insert_frame(frame_no, frame)
@@ -2293,7 +2293,7 @@ impl Connection {
     /// Start WAL session by initiating read+write transaction for this connection
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_insert_begin(&self) -> Result<()> {
-        if self.db.is_encrypted_overlap_reader() {
+        if self.db.is_encrypted_overlap_reader() || self.db.is_managed_wal_writer() {
             return Err(LimboError::ReadOnly);
         }
         let pager = self.pager.load();
@@ -2324,7 +2324,7 @@ impl Connection {
     pub fn wal_insert_end(self: &Arc<Connection>, force_commit: bool) -> Result<()> {
         use crate::{return_if_io, types::IOResult};
 
-        if self.db.is_encrypted_overlap_reader() {
+        if self.db.is_encrypted_overlap_reader() || self.db.is_managed_wal_writer() {
             return Err(LimboError::ReadOnly);
         }
         {
@@ -2499,6 +2499,23 @@ impl Connection {
                 .checkpoint_shutdown(self.wal_auto_actions(), self.get_sync_mode())?;
         };
         Ok(())
+    }
+
+    /// Verify a prepared handoff using this attached reader's encryption context.
+    /// The existing reader and its SQL snapshot remain usable after verification.
+    #[cfg(encrypted_wal_handoff)]
+    pub fn verify_encrypted_wal_successor(
+        &self,
+        previous: crate::WriterClaim,
+        transfer: crate::WriterTransfer,
+    ) -> Result<crate::EncryptedWalWriteBoundary> {
+        if self.is_closed() {
+            return Err(LimboError::InvalidArgument(
+                "handoff reader must be open".into(),
+            ));
+        }
+        self.db
+            .verify_encrypted_wal_successor(&self.pager.load(), previous, transfer)
     }
 
     /// Disable every automatic WAL maintenance action for this connection

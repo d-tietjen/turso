@@ -14,6 +14,8 @@ pub(crate) mod btree;
 pub(crate) mod buffer_pool;
 pub(crate) mod checksum;
 pub mod database;
+#[cfg(encrypted_wal_handoff)]
+pub(crate) mod encrypted_wal_handoff;
 pub(crate) mod encryption;
 pub(crate) mod journal_mode;
 #[cfg(feature = "aristo-instr")]

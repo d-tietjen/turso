@@ -205,6 +205,19 @@ impl WalSnapshot {
     }
 }
 
+#[cfg(host_shared_wal)]
+impl From<SharedWalCoordinationHeader> for WalSnapshot {
+    fn from(snapshot: SharedWalCoordinationHeader) -> Self {
+        Self {
+            max_frame: snapshot.max_frame,
+            nbackfills: snapshot.nbackfills,
+            last_checksum: (snapshot.checksum_1, snapshot.checksum_2),
+            checkpoint_seq: snapshot.checkpoint_seq,
+            transaction_count: snapshot.transaction_count,
+        }
+    }
+}
+
 /// Which read-mark, if any, currently protects this connection's snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReadGuardKind {
@@ -488,6 +501,12 @@ enum CoordinationCheckpointGuardKind {
 
 /// Coordination operations that back the WAL's authoritative state.
 trait WalCoordination: Debug + Send + Sync {
+    /// Whether the backing is enrolled in managed writer handoff.
+    #[cfg(encrypted_wal_handoff)]
+    fn has_managed_writer(&self) -> bool {
+        false
+    }
+
     /// Whether the handle is restricted to read snapshots.
     fn is_overlap_reader(&self) -> bool {
         false
@@ -495,6 +514,11 @@ trait WalCoordination: Debug + Send + Sync {
 
     /// Load the current authoritative WAL snapshot.
     fn load_snapshot(&self) -> WalSnapshot;
+
+    /// Sample the WAL snapshot for read admission. None means publication is incomplete.
+    fn try_load_snapshot(&self) -> Option<WalSnapshot> {
+        Some(self.load_snapshot())
+    }
 
     /// Ensure any process-local fallback cache is complete for `snapshot`.
     fn ensure_local_frame_cache_covers(
@@ -630,6 +654,12 @@ trait WalCoordination: Debug + Send + Sync {
 /// Write-ahead log (WAL).
 #[aristo::intent("The WAL subsystem maintains LSN monotonicity, frame commitment ordering, recovery idempotency, checkpoint safety, and group commit atomicity.", id = "wal_protocol_correctness", verify = "neural")]
 pub trait Wal: Debug + Send + Sync {
+    /// Managed handles never use caller-driven raw WAL mutation or shutdown sync.
+    #[cfg(encrypted_wal_handoff)]
+    fn has_managed_writer(&self) -> bool {
+        false
+    }
+
     /// Begin a read transaction.
     /// Returns whether the database state has changed since the last read transaction.
     fn begin_read_tx(&self) -> Result<bool>;
@@ -660,7 +690,7 @@ pub trait Wal: Debug + Send + Sync {
     /// Whether shutdown checkpointing is valid when this process closes its last connection.
     fn should_checkpoint_on_close(&self) -> bool;
 
-    /// Find the latest frame containing a page.
+    /// Find the latest frame containing a page within the connection's pinned snapshot.
     ///
     /// optional frame_watermark parameter can be passed to force WAL to find frame not larger than watermark value
     /// caller must guarantee, that frame_watermark must be greater than last checkpointed frame, otherwise method will panic
@@ -1525,7 +1555,11 @@ impl ShmWalCoordination {
             active_reader: Mutex::new(None),
             overlap_reader,
         };
-        if !overlap_reader {
+        #[cfg(encrypted_wal_handoff)]
+        let seed_authority = !overlap_reader && !coordination.has_managed_writer();
+        #[cfg(not(encrypted_wal_handoff))]
+        let seed_authority = !overlap_reader;
+        if seed_authority {
             coordination.seed_or_sync_authority();
         }
         coordination
@@ -1927,7 +1961,7 @@ impl ShmWalCoordination {
             return Ok(());
         }
 
-        let authority_snapshot = self.authority.snapshot();
+        let authority_snapshot = self.authority.try_snapshot().ok_or(LimboError::Busy)?;
         if authority_snapshot.checkpoint_seq != required_snapshot.checkpoint_seq {
             return Err(LimboError::Busy);
         }
@@ -1948,19 +1982,21 @@ impl ShmWalCoordination {
 
 #[cfg(host_shared_wal)]
 impl WalCoordination for ShmWalCoordination {
+    #[cfg(encrypted_wal_handoff)]
+    fn has_managed_writer(&self) -> bool {
+        self.authority.managed()
+    }
+
     fn is_overlap_reader(&self) -> bool {
         self.overlap_reader
     }
 
     fn load_snapshot(&self) -> WalSnapshot {
-        let snapshot = self.authority.snapshot();
-        WalSnapshot {
-            max_frame: snapshot.max_frame,
-            nbackfills: snapshot.nbackfills,
-            last_checksum: (snapshot.checksum_1, snapshot.checksum_2),
-            checkpoint_seq: snapshot.checkpoint_seq,
-            transaction_count: snapshot.transaction_count,
-        }
+        self.authority.snapshot().into()
+    }
+
+    fn try_load_snapshot(&self) -> Option<WalSnapshot> {
+        self.authority.try_snapshot().map(WalSnapshot::from)
     }
 
     fn ensure_local_frame_cache_covers(
@@ -2095,7 +2131,7 @@ impl WalCoordination for ShmWalCoordination {
         // See the in-process coordination: a checkpoint holding read-mark 0
         // must not make readers wait, so fall through to the other marks.
         if snapshot.max_frame == snapshot.nbackfills && read_locks[0].read() {
-            if self.load_snapshot() != snapshot {
+            if self.try_load_snapshot() != Some(snapshot) {
                 read_locks[0].unlock();
                 return None;
             }
@@ -2138,7 +2174,7 @@ impl WalCoordination for ShmWalCoordination {
         }
 
         let current_slot_mark = read_locks[best_idx as usize].get_value();
-        if current_slot_mark != best_mark || self.load_snapshot() != snapshot {
+        if current_slot_mark != best_mark || self.try_load_snapshot() != Some(snapshot) {
             read_locks[best_idx as usize].unlock();
             return None;
         }
@@ -2473,6 +2509,10 @@ impl WalCoordination for ShmWalCoordination {
     }
 
     fn should_checkpoint_on_close(&self) -> bool {
+        #[cfg(encrypted_wal_handoff)]
+        if self.has_managed_writer() {
+            return false;
+        }
         !self.overlap_reader && self.authority.is_last_process_mapping()
     }
 
@@ -2553,7 +2593,7 @@ impl ShmWalCoordination {
         );
         if (self.overlap_reader
             && (self.authority.frame_index_overflowed() || self.authority.checkpoint_lock_active()))
-            || self.load_snapshot() != snapshot
+            || self.try_load_snapshot() != Some(snapshot)
         {
             self.authority.unregister_reader_for_snapshot(reader);
             read_locks[read_lock_idx].unlock();
@@ -3240,6 +3280,15 @@ fn pack_checksum(checksum: (u32, u32)) -> u64 {
 }
 
 impl WalFile {
+    /// Require an existing writer lock for direct WAL mutations in this profile.
+    #[cfg(encrypted_wal_handoff)]
+    fn require_managed_write_lock(&self) -> Result<()> {
+        if self.has_managed_writer() && !self.holds_write_lock() {
+            return Err(LimboError::ReadOnly);
+        }
+        Ok(())
+    }
+
     fn prepare_transformed_frame(
         buffer_pool: &Arc<BufferPool>,
         wal_header: &WalHeader,
@@ -3425,7 +3474,13 @@ impl WalFile {
 
         // Snapshot the shared WAL state. We haven't taken a read lock yet, so we need
         // to validate these values later.
-        let shared_snapshot = self.load_coordination_snapshot();
+        let Some(shared_snapshot) = self.coordination.try_load_snapshot() else {
+            return if self.coordination.is_overlap_reader() {
+                TryBeginReadResult::Busy
+            } else {
+                TryBeginReadResult::Retry
+            };
+        };
         turso_assert!(
             shared_snapshot.nbackfills <= shared_snapshot.max_frame,
             "WAL snapshot cannot have backfills beyond max frame",
@@ -3649,6 +3704,11 @@ impl Wal for WalFile {
         self.coordination.should_checkpoint_on_close()
     }
 
+    #[cfg(encrypted_wal_handoff)]
+    fn has_managed_writer(&self) -> bool {
+        self.coordination.has_managed_writer()
+    }
+
     /// Find the latest frame containing a page.
     #[instrument(skip_all, level = Level::DEBUG)]
     #[aristo::intent(
@@ -3673,12 +3733,20 @@ impl Wal for WalFile {
         //
         // if it's not, than pages from WAL range [frame_watermark..nBackfill] are already in the DB file,
         // and in case if page first occurrence in WAL was after frame_watermark - we will be unable to read proper previous version of the page
-        let nbackfills = self.load_coordination_snapshot().nbackfills;
-        turso_assert!(
-            frame_watermark.is_none() || frame_watermark.unwrap() >= nbackfills,
-            "frame_watermark must be >= than current WAL backfill amount",
-            { "frame_watermark": frame_watermark, "nbackfills": nbackfills }
-        );
+        if let Some(frame_watermark) = frame_watermark {
+            let snapshot = if self.coordination.is_overlap_reader() {
+                self.coordination
+                    .try_load_snapshot()
+                    .ok_or(LimboError::Busy)?
+            } else {
+                self.load_coordination_snapshot()
+            };
+            turso_assert!(
+                frame_watermark >= snapshot.nbackfills,
+                "frame_watermark must be >= than current WAL backfill amount",
+                { "frame_watermark": frame_watermark, "nbackfills": snapshot.nbackfills }
+            );
+        }
 
         // A fully backfilled snapshot (max_frame < min_frame, that is
         // max_frame == nbackfills) has nothing visible in the WAL: read
@@ -3702,9 +3770,9 @@ impl Wal for WalFile {
             &self.io,
             WalSnapshot {
                 max_frame,
-                nbackfills: self.min_frame.load(Ordering::Acquire).saturating_sub(1),
+                nbackfills: min_frame.saturating_sub(1),
                 last_checksum: self.last_checksum(),
-                checkpoint_seq: self.coordination.wal_header().checkpoint_seq,
+                checkpoint_seq: self.checkpoint_seq.load(Ordering::Acquire),
                 transaction_count: self.transaction_count.load(Ordering::Acquire),
             },
         )?;
@@ -3729,7 +3797,7 @@ impl Wal for WalFile {
         Ok(frame)
     }
 
-    /// Read a frame from the WAL.
+    /// Read a WAL frame using the page size configured for the pager's read buffer.
     #[instrument(skip_all, level = Level::DEBUG)]
     fn read_frame(
         &self,
@@ -3743,7 +3811,7 @@ impl Wal for WalFile {
             page.get().id(),
             frame_id
         );
-        let offset = self.frame_offset(frame_id);
+        let offset = Self::frame_offset_for_page_size(frame_id, buffer_pool.database_page_size());
         page.set_locked();
         let frame = page.clone();
         let page_idx = page.get().id();
@@ -4033,6 +4101,10 @@ impl Wal for WalFile {
         page: &[u8],
         sync_type: FileSyncType,
     ) -> Result<()> {
+        #[cfg(encrypted_wal_handoff)]
+        if self.has_managed_writer() {
+            return Err(LimboError::ReadOnly);
+        }
         let Some(page_size) = PageSize::new(page.len() as u32) else {
             bail_corrupt_error!("invalid page size: {}", page.len());
         };
@@ -4206,6 +4278,16 @@ impl Wal for WalFile {
 
     #[instrument(err, skip_all, level = Level::DEBUG)]
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion> {
+        #[cfg(encrypted_wal_handoff)]
+        let _managed_checkpoint = if self.has_managed_writer() && !self.holds_write_lock() {
+            let checkpoint = self.checkpoint_guard.read();
+            if checkpoint.is_none() {
+                return Err(LimboError::ReadOnly);
+            }
+            Some(checkpoint)
+        } else {
+            None
+        };
         tracing::debug!("wal_sync");
         let syncing = self.syncing.clone();
         let dirty = self.dirty.clone();
@@ -4270,6 +4352,10 @@ impl Wal for WalFile {
     #[instrument(skip_all, level = Level::DEBUG)]
 
     fn rollback(&self, rollback_to: Option<RollbackTo>) {
+        #[cfg(encrypted_wal_handoff)]
+        if self.require_managed_write_lock().is_err() {
+            return;
+        }
         if self.coordination.is_overlap_reader() {
             // Reader savepoints do not own any WAL frames.
             return;
@@ -4329,6 +4415,10 @@ impl Wal for WalFile {
     }
 
     fn try_begin_vacuum_checkpoint_lock(&self) -> Result<()> {
+        #[cfg(encrypted_wal_handoff)]
+        if self.has_managed_writer() {
+            return Err(LimboError::ReadOnly);
+        }
         self.with_shared(|shared| {
             if !shared.runtime.checkpoint_lock.write() {
                 return Err(LimboError::Busy);
@@ -4344,6 +4434,10 @@ impl Wal for WalFile {
     }
 
     fn begin_vacuum_blocking_tx(&self) -> Result<()> {
+        #[cfg(encrypted_wal_handoff)]
+        if self.has_managed_writer() {
+            return Err(LimboError::ReadOnly);
+        }
         if self.coordination.is_overlap_reader() {
             return Err(LimboError::ReadOnly);
         }
@@ -4449,6 +4543,8 @@ impl Wal for WalFile {
     }
 
     fn prepare_wal_start(&self, page_size: PageSize) -> Result<Option<Completion>> {
+        #[cfg(encrypted_wal_handoff)]
+        self.require_managed_write_lock()?;
         if self.coordination.is_overlap_reader() {
             return Err(LimboError::ReadOnly);
         }
@@ -4501,6 +4597,8 @@ impl Wal for WalFile {
         parent = "wal_protocol_correctness"
     )]
     fn prepare_wal_finish(&self, sync_type: FileSyncType) -> Result<Completion> {
+        #[cfg(encrypted_wal_handoff)]
+        self.require_managed_write_lock()?;
         let file = self.coordination.wal_file()?;
         let coordination = self.coordination.clone();
         let c = file.sync(
@@ -4837,23 +4935,24 @@ impl Wal for WalFile {
 
 impl WalFile {
     /// Build the reader's WAL without publishing or recovering shared state.
+    /// Return Busy if there is no stable snapshot.
     #[cfg(host_shared_wal)]
     pub(crate) fn new_overlap_reader(
         io: Arc<dyn IO>,
         shared: Arc<RwLock<WalFileShared>>,
         authority: Arc<MappedSharedWalCoordination>,
         buffer_pool: Arc<BufferPool>,
-    ) -> Self {
+    ) -> Result<Self> {
         let coordination = Arc::new(ShmWalCoordination::with_overlap_role(
             shared, authority, true,
         ));
-        let snapshot = coordination.load_snapshot();
-        Self::new_with_coordination(
+        let snapshot = coordination.try_load_snapshot().ok_or(LimboError::Busy)?;
+        Ok(Self::new_with_coordination(
             io,
             coordination,
             (snapshot.last_checksum, snapshot.max_frame),
             buffer_pool,
-        )
+        ))
     }
 
     #[cfg(host_shared_wal)]
@@ -4955,8 +5054,12 @@ impl WalFile {
     }
 
     fn frame_offset(&self, frame_id: u64) -> u64 {
+        Self::frame_offset_for_page_size(frame_id, self.page_size() as usize)
+    }
+
+    fn frame_offset_for_page_size(frame_id: u64, page_size: usize) -> u64 {
         turso_assert_greater_than!(frame_id, 0, "Frame ID must be 1-based");
-        let page_offset = (frame_id - 1) * (self.page_size() + WAL_FRAME_HEADER_SIZE as u32) as u64;
+        let page_offset = (frame_id - 1) * (page_size + WAL_FRAME_HEADER_SIZE) as u64;
         WAL_HEADER_SIZE as u64 + page_offset
     }
 
@@ -5355,6 +5458,8 @@ impl WalFile {
     /// 3. nbackfills > 0 - otherwise nothing was backfilled and there is no reason to truncate header
     /// 4. max_frame == nbackfills - otherwise there are some non-checkpointed frames in the WAL and we can't truncate the log
     pub fn try_restart_log_before_write(&self) -> Result<()> {
+        #[cfg(encrypted_wal_handoff)]
+        self.require_managed_write_lock()?;
         let max_frame_read_lock_index = self.max_frame_read_lock_index.load(Ordering::Acquire);
         if max_frame_read_lock_index != 0 {
             tracing::debug!(
@@ -5863,6 +5968,85 @@ impl WalFileShared {
         )
     }
 
+    /// Sync the exact WAL backing for a transition with both mutation locks held.
+    /// A physical WAL requiring reconciliation is refused without rebuilding its index.
+    #[cfg(host_shared_wal)]
+    pub(crate) fn sync_handoff_boundary(
+        io: &Arc<dyn IO>,
+        file: &Arc<dyn crate::io::File>,
+        snapshot: SharedWalCoordinationHeader,
+    ) -> Result<crate::io::FileId> {
+        let identity = Self::verify_handoff_boundary(io, file, snapshot)?;
+        io.wait_for_completion(file.sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)?)?;
+        Ok(identity)
+    }
+
+    /// Verify a committed physical WAL under both mutation locks without repair.
+    #[cfg(host_shared_wal)]
+    pub(crate) fn verify_handoff_boundary(
+        io: &Arc<dyn IO>,
+        file: &Arc<dyn crate::io::File>,
+        snapshot: SharedWalCoordinationHeader,
+    ) -> Result<crate::io::FileId> {
+        if !matches!(
+            classify_authority_snapshot_against_wal(io, file, snapshot)?,
+            AuthoritySnapshotValidation::Trusted
+        ) {
+            return Err(LimboError::Busy);
+        }
+        file.opened_file_id()
+    }
+
+    /// Authenticate the reader's retained page one and any positive backfill
+    /// proof while both mutation bytes are held. This does not republish state.
+    #[cfg(encrypted_wal_handoff)]
+    pub(crate) fn authenticate_handoff_page_one(
+        io: &Arc<dyn IO>,
+        file: &Arc<dyn DatabaseStorage>,
+        reader: &Pager,
+        authority: &MappedSharedWalCoordination,
+        position: &[u8; SharedWalCoordinationHeader::BYTE_LEN],
+    ) -> Result<()> {
+        let snapshot = SharedWalCoordinationHeader::decode(position)?;
+        let identity = read_database_identity_from_storage(io, file, Some(reader))?
+            .ok_or(LimboError::NotADB)?;
+        if snapshot.nbackfills != 0 {
+            let matches =
+                |crc| authority.validate_backfill_proof(snapshot, identity.db_size_pages, crc);
+            if !matches(identity.header_crc32c)
+                && !identity.legacy_encoded_crc32c.is_some_and(matches)
+            {
+                return Err(LimboError::Busy);
+            }
+        }
+        Ok(())
+    }
+
+    /// Adopt the writable handle for a verified native WAL without reopening it.
+    /// The caller must verify the physical WAL and its mapped snapshot while
+    /// holding both mutation locks. The shared frame index stays in the mapping.
+    #[cfg(encrypted_wal_handoff)]
+    pub(crate) fn from_verified_handoff(
+        file: Arc<dyn crate::io::File>,
+        boundary: &crate::EncryptedWalWriteBoundary,
+    ) -> Result<Arc<RwLock<WalFileShared>>> {
+        if file.opened_file_id()? != boundary.wal {
+            return Err(LimboError::InvalidArgument(
+                "handoff WAL handle differs from the verified WAL".into(),
+            ));
+        }
+        let snapshot = SharedWalCoordinationHeader::decode(&boundary.wal_position)?;
+        if snapshot.max_frame != boundary.committed_frames
+            || snapshot.nbackfills > snapshot.max_frame
+        {
+            return Err(LimboError::Corrupt(
+                "invalid committed WAL position in handoff boundary".into(),
+            ));
+        }
+        let wal_size = file.size()?;
+        Ok(Self::from_authority_snapshot(file, snapshot, wal_size))
+    }
+
     /// Open a normal WAL participant using the opening pager to authenticate encrypted backfill.
     #[cfg(host_shared_wal)]
     pub(crate) fn open_shared_from_authority_if_exists(
@@ -5898,6 +6082,7 @@ impl WalFileShared {
     }
 
     /// Validate the shared snapshot before constructing the local WAL view.
+    /// An overlap open returns Busy when it cannot sample a stable snapshot.
     /// Only an ordinary participant may recover when the snapshot cannot be reused.
     #[cfg(host_shared_wal)]
     fn open_shared_from_authority(
@@ -5909,7 +6094,11 @@ impl WalFileShared {
         encrypted_pager: Option<&Pager>,
         overlap_reader: bool,
     ) -> Result<Arc<RwLock<WalFileShared>>> {
-        let snapshot = authority.snapshot();
+        let snapshot = if overlap_reader {
+            authority.try_snapshot().ok_or(LimboError::Busy)?
+        } else {
+            authority.snapshot()
+        };
         let file = match io.open_file(path, flags, false) {
             Ok(file) => file,
             Err(LimboError::CompletionError(CompletionError::IOError(
@@ -5985,10 +6174,20 @@ impl WalFileShared {
             }
         }
         if overlap_reader
-            && (authority.checkpoint_lock_active() || authority.snapshot() != snapshot)
+            && (authority.checkpoint_lock_active() || authority.try_snapshot() != Some(snapshot))
         {
             return Err(LimboError::Busy);
         }
+        Ok(Self::from_authority_snapshot(file, snapshot, wal_size))
+    }
+
+    /// Build the local WAL state for an already-validated snapshot and open file.
+    #[cfg(host_shared_wal)]
+    fn from_authority_snapshot(
+        file: Arc<dyn crate::io::File>,
+        snapshot: SharedWalCoordinationHeader,
+        wal_size: u64,
+    ) -> Arc<RwLock<WalFileShared>> {
         let wal_is_initialized = wal_size >= WAL_HEADER_SIZE as u64;
 
         let wal_header = WalHeader {
@@ -6034,7 +6233,7 @@ impl WalFileShared {
                 )),
             },
         };
-        Ok(Arc::new(RwLock::new(shared)))
+        Arc::new(RwLock::new(shared))
     }
 
     pub fn open_shared_if_exists(
@@ -6951,7 +7150,7 @@ pub mod test {
     }
 
     #[test]
-    fn page_codec_round_trips_wal_batch_reads() {
+    fn page_codec_round_trips_wal_frame_and_batch_reads() {
         let page_size = 512;
         let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
         set_test_page_codec(&wal, Arc::new(TestPageCodec::Xor(0xa5)));
@@ -6960,6 +7159,13 @@ pub mod test {
             page_with_pattern(33, 0x20, &buffer_pool),
         ];
         let expected = append_test_pages(&io, &wal, page_size, &source_pages);
+
+        let second_page = Arc::new(crate::Page::new(33));
+        let read = wal
+            .read_frame(2, second_page.clone(), buffer_pool.clone(), None)
+            .expect("read uncached second frame");
+        io.wait_for_completion(read).expect("complete frame read");
+        assert_eq!(second_page.get_contents().as_ptr(), expected[1].as_slice());
 
         let target_pages = vec![
             Arc::new(crate::Page::new(32)),
@@ -7465,7 +7671,7 @@ pub mod test {
     }
 
     #[cfg(host_shared_wal)]
-    fn write_test_wal_with_single_commit_frame(
+    pub(in crate::storage) fn write_test_wal_with_single_commit_frame(
         io: &Arc<dyn IO>,
         wal_path: &std::path::Path,
     ) -> SharedWalCoordinationHeader {
@@ -8687,6 +8893,59 @@ pub mod test {
             .loaded_from_disk_scan
             .load(Ordering::Acquire));
         assert!(shared.runtime.frame_cache.lock().is_empty());
+    }
+
+    #[cfg(encrypted_wal_handoff)]
+    #[test]
+    fn test_verified_handoff_adopts_open_wal_and_committed_checksum() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test.db-wal");
+        let shm_path = dir.path().join("test.db-tshm");
+        let io = shared_wal_test_io();
+        let snapshot = write_test_wal_with_single_commit_frame(&io, &wal_path);
+        let authority = MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap();
+        authority.install_snapshot(snapshot);
+        authority.record_frame(7, 1);
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::NoLock, false)
+            .unwrap();
+        let (shared, boundary) = authority
+            .with_handoff_locks(|| {
+                let snapshot = authority.try_snapshot().ok_or(LimboError::Busy)?;
+                let boundary = crate::EncryptedWalWriteBoundary {
+                    database: open_test_db_file_for_wal(&io, &wal_path).opened_file_id()?,
+                    wal: WalFileShared::verify_handoff_boundary(&io, &file, snapshot)?,
+                    coordinator: authority.opened_file_id()?,
+                    committed_frames: snapshot.max_frame,
+                    wal_position: snapshot.encode(),
+                };
+                let shared = WalFileShared::from_verified_handoff(file.clone(), &boundary)?;
+                Ok((shared, boundary))
+            })
+            .unwrap();
+        let shared = shared.read();
+        assert!(Arc::ptr_eq(shared.runtime.file.as_ref().unwrap(), &file));
+        assert_eq!(
+            shared.last_checksum_and_max_frame(),
+            (
+                (snapshot.checksum_1, snapshot.checksum_2),
+                snapshot.max_frame
+            )
+        );
+        assert!(shared.metadata.initialized.load(Ordering::Acquire));
+        assert!(!shared
+            .metadata
+            .loaded_from_disk_scan
+            .load(Ordering::Acquire));
+
+        let wrong_file = crate::EncryptedWalWriteBoundary {
+            wal: boundary.database,
+            ..boundary
+        };
+        assert!(matches!(
+            WalFileShared::from_verified_handoff(file, &wrong_file),
+            Err(LimboError::InvalidArgument(_))
+        ));
     }
 
     #[cfg(host_shared_wal)]
