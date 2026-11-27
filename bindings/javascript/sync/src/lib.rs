@@ -221,7 +221,7 @@ impl SyncEngine {
         let io: Arc<dyn turso_core::IO> = if is_memory {
             Arc::new(turso_core::MemoryIO::new())
         } else {
-            #[cfg(all(target_os = "linux", not(feature = "browser")))]
+            #[cfg(target_os = "linux")]
             {
                 if opts.partial_sync_opts.is_none() {
                     Arc::new(turso_core::PlatformIO::new().map_err(|e| {
@@ -241,7 +241,10 @@ impl SyncEngine {
                     })?)
                 }
             }
-            #[cfg(all(not(target_os = "linux"), not(feature = "browser")))]
+            #[cfg(all(
+                not(target_os = "linux"),
+                not(all(feature = "browser", target_family = "wasm"))
+            ))]
             {
                 Arc::new(turso_core::PlatformIO::new().map_err(|e| {
                     napi::Error::new(
@@ -250,7 +253,7 @@ impl SyncEngine {
                     )
                 })?)
             }
-            #[cfg(feature = "browser")]
+            #[cfg(all(feature = "browser", target_family = "wasm"))]
             {
                 turso_node::browser::opfs()
             }

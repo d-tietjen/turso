@@ -106,18 +106,6 @@ impl Default for Opfs {
 #[link(wasm_import_module = "env")]
 extern "C" {
     fn lookup_file(path: *const u8, path_len: usize) -> i32;
-    #[allow(
-        unknown_lints,
-        invalid_runtime_symbol_definitions,
-        reason = "the WebAssembly host supplies this OPFS import with its own ABI"
-    )]
-    fn read(handle: i32, buffer: *mut u8, buffer_len: usize, offset: i32) -> i32;
-    #[allow(
-        unknown_lints,
-        invalid_runtime_symbol_definitions,
-        reason = "the WebAssembly host supplies this OPFS import with its own ABI"
-    )]
-    fn write(handle: i32, buffer: *const u8, buffer_len: usize, offset: i32) -> i32;
     fn sync(handle: i32) -> i32;
     fn truncate(handle: i32, length: usize) -> i32;
     fn size(handle: i32) -> i32;
@@ -129,6 +117,17 @@ extern "C" {
     // fn size_async(handle: i32) -> i32;
 
     fn is_web_worker() -> bool;
+}
+
+#[allow(
+    unknown_lints,
+    invalid_runtime_symbol_definitions,
+    reason = "the browser supplies these OPFS callbacks through the WebAssembly env module"
+)]
+#[link(wasm_import_module = "env")]
+extern "C" {
+    fn read(handle: i32, buffer: *mut u8, buffer_len: usize, offset: i32) -> i32;
+    fn write(handle: i32, buffer: *const u8, buffer_len: usize, offset: i32) -> i32;
 }
 
 fn is_web_worker_safe() -> bool {

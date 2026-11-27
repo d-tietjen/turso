@@ -14322,8 +14322,8 @@ mod tests {
             #[cfg(debug_assertions)]
             debug_validate_cells_core(contents, pager.usable_space());
             // check cells are correct
-            let mut cell_idx_cloned = if prefix { size } else { 0 };
-            for cell_idx in 0..contents.cell_count() {
+            let cloned_start = if prefix { size } else { 0 };
+            for (cell_idx, cell_idx_cloned) in (0..contents.cell_count()).zip(cloned_start..) {
                 let buf = contents.as_ptr();
                 let (start, len) = contents
                     .cell_get_raw_region(cell_idx, pager.usable_space())
@@ -14331,7 +14331,6 @@ mod tests {
                 let cell_in_page = &buf[start..start + len];
                 let cell_in_array = &cells_cloned[cell_idx_cloned];
                 assert_eq!(cell_in_page, cell_in_array);
-                cell_idx_cloned += 1;
             }
         }
     }
