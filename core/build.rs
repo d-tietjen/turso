@@ -1,12 +1,22 @@
-use cfg_aliases::cfg_aliases;
 use std::path::PathBuf;
 use std::process::Command;
 use std::{env, fs};
 
 fn main() {
-    cfg_aliases! {
-        injected_yields: { any(feature = "test_helper", feature = "simulator") },
-        host_shared_wal: { all(any(unix, target_os = "windows"), target_pointer_width = "64") },
+    println!("cargo:rustc-check-cfg=cfg(injected_yields)");
+    if env::var("CARGO_FEATURE_TEST_HELPER").as_deref() == Ok("1")
+        || env::var("CARGO_FEATURE_SIMULATOR").as_deref() == Ok("1")
+    {
+        println!("cargo:rustc-cfg=injected_yields");
+    }
+
+    println!("cargo:rustc-check-cfg=cfg(host_shared_wal)");
+    let target_cfg_contains =
+        |key, value| env::var(key).is_ok_and(|values| values.split(',').any(|item| item == value));
+    let shared_wal_host =
+        env::var("CARGO_CFG_UNIX").is_ok() || target_cfg_contains("CARGO_CFG_TARGET_OS", "windows");
+    if shared_wal_host && target_cfg_contains("CARGO_CFG_TARGET_POINTER_WIDTH", "64") {
+        println!("cargo:rustc-cfg=host_shared_wal");
     }
 
     // Ensure Cargo reruns when this script or the reproducibility seed changes.

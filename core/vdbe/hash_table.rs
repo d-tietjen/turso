@@ -1112,11 +1112,10 @@ impl HashTable {
             return count;
         }
 
-        let avg_entry_size = if self.num_entries > 0 {
-            (self.mem_used / self.num_entries).max(entry_size)
-        } else {
-            entry_size.max(1)
-        };
+        let avg_entry_size = self
+            .mem_used
+            .checked_div(self.num_entries)
+            .map_or_else(|| entry_size.max(1), |average| average.max(entry_size));
         let target_partition_bytes = (self.mem_budget / 2).max(avg_entry_size);
         let target_entries_per_partition = (target_partition_bytes / avg_entry_size).max(1);
         let estimated_total_entries = self.num_entries.saturating_add(1);
@@ -1230,12 +1229,8 @@ impl HashTable {
             HashEntry::new_with_payload(hash, key_values, rowid, payload_values)
         };
 
-        if self.spill_state.is_some() {
-            let partition_idx = {
-                let spill_state = self.spill_state.as_ref().expect("spill state must exist");
-                spill_state.partitioning.index(hash)
-            };
-            let spill_state = self.spill_state.as_mut().expect("spill state must exist");
+        if let Some(spill_state) = self.spill_state.as_mut() {
+            let partition_idx = spill_state.partitioning.index(hash);
             // In spilled mode, insert into partition buffer
             spill_state.partition_buffers[partition_idx].insert(entry)?;
         } else {
@@ -1744,7 +1739,7 @@ impl HashTable {
             .filter(|(_, p)| !p.is_empty())
             .map(|(idx, p)| (idx, p.mem_used))
             .try_collect()?;
-        candidates.sort_by(|a, b| b.1.cmp(&a.1)); // Sort descending by mem_used
+        candidates.sort_by_key(|&(_, mem_used)| std::cmp::Reverse(mem_used));
 
         for (partition_idx, mem_used) in candidates {
             if projected_mem_used + entry_size <= self.mem_budget {

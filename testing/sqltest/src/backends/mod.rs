@@ -103,6 +103,10 @@ impl DatabaseFileHandle {
 }
 
 /// Backend trait for executing SQL against a target
+#[allow(
+    clippy::double_must_use,
+    reason = "async-trait adds must_use to its boxed futures"
+)]
 #[async_trait]
 pub trait SqlBackend: Send + Sync {
     /// Name of this backend (for filtering and display)
@@ -133,6 +137,10 @@ pub trait SqlBackend: Send + Sync {
 }
 
 /// An isolated database instance
+#[allow(
+    clippy::double_must_use,
+    reason = "async-trait adds must_use to its boxed futures"
+)]
 #[async_trait]
 pub trait DatabaseInstance: Send + Sync {
     /// Execute setup SQL (DDL, inserts, etc.)

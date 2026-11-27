@@ -68,10 +68,8 @@ pub(super) fn resolve_qualified_on_ref(
                 return Ok(Some(QualifiedMatch::RowId));
             }
         }
-        Table::Virtual(_) => {
-            if parse_row_id(normalized_id, internal_id, || false)?.is_some() {
-                return Ok(Some(QualifiedMatch::RowId));
-            }
+        Table::Virtual(_) if parse_row_id(normalized_id, internal_id, || false)?.is_some() => {
+            return Ok(Some(QualifiedMatch::RowId));
         }
         _ => {}
     }
@@ -126,7 +124,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                 .as_ref()
                                 .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
                         });
-                        if col_idx.is_some() {
+                        if let Some(col_idx) = col_idx {
                             if match_result.is_some() {
                                 let mut ok = false;
                                 // Column name ambiguity is ok if it is in the USING clause because then it is deduplicated
@@ -145,13 +143,9 @@ pub fn bind_and_rewrite_expr<'a>(
                                     );
                                 }
                             } else {
-                                let col =
-                                    joined_table.table.columns().get(col_idx.unwrap()).unwrap();
-                                match_result = Some((
-                                    joined_table.internal_id,
-                                    col_idx.unwrap(),
-                                    col.is_rowid_alias(),
-                                ));
+                                let col = &joined_table.table.columns()[col_idx];
+                                match_result =
+                                    Some((joined_table.internal_id, col_idx, col.is_rowid_alias()));
                             }
                         // only if we haven't found a match, check for explicit rowid reference
                         } else if let Table::BTree(btree) = &joined_table.table {
@@ -212,8 +206,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                     .as_ref()
                                     .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
                             });
-                            if col_idx.is_some() {
-                                let col_idx = col_idx.unwrap();
+                            if let Some(col_idx) = col_idx {
                                 if outer_ref.using_dedup_hidden_cols.get(col_idx) {
                                     continue;
                                 }
@@ -223,7 +216,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                         id.as_str()
                                     );
                                 }
-                                let col = outer_ref.table.columns().get(col_idx).unwrap();
+                                let col = &outer_ref.table.columns()[col_idx];
                                 match_result =
                                     Some((outer_ref.internal_id, col_idx, col.is_rowid_alias()));
                                 matched_scope_depth = Some(outer_ref.scope_depth);

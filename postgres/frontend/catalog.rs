@@ -621,15 +621,13 @@ impl PgNamespaceCursor {
 
         // Add attached schemas (CREATE SCHEMA creates attached databases)
         let schema_names = self.conn.attached_database_names();
-        let mut oid = 16384i64;
-        for name in schema_names {
+        for (name, oid) in schema_names.into_iter().zip(16384i64..) {
             self.rows.push(vec![
                 Value::from_i64(oid),
                 Value::build_text(name),
                 Value::from_i64(10), // nspowner (bootstrap superuser)
                 Value::Null,         // nspacl
             ]);
-            oid += 1;
         }
         Ok(())
     }
@@ -763,12 +761,10 @@ impl PgAttributeCursor {
         let schema = self.conn.current_schema();
         self.rows.clear();
 
-        let mut oid_counter = USER_TABLE_OID_START;
-
-        for (_, table) in user_tables_sorted(&schema) {
-            let table_oid = oid_counter;
-            oid_counter += 1;
-
+        for ((_, table), table_oid) in user_tables_sorted(&schema)
+            .into_iter()
+            .zip(USER_TABLE_OID_START..)
+        {
             let columns = table.columns();
             for (i, col) in columns.iter().enumerate() {
                 let col_name = col.name.clone().unwrap_or_default();

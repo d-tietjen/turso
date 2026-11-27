@@ -309,11 +309,21 @@ impl SimIO for MemorySimIO {
             !self.power_loss_in_progress.swap(true, Ordering::AcqRel),
             "power loss cannot be nested"
         );
-        self.generation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
-                generation.checked_add(1)
-            })
-            .expect("memory simulator crash generation overflow");
+        let mut generation = self.generation.load(Ordering::Acquire);
+        loop {
+            let next = generation
+                .checked_add(1)
+                .expect("memory simulator crash generation overflow");
+            match self.generation.compare_exchange_weak(
+                generation,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => generation = observed,
+            }
+        }
         self.close_files();
         let pending = {
             let mut callbacks = self.callbacks.lock();

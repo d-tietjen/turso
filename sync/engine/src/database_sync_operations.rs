@@ -3071,15 +3071,17 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
             last_change_id
         );
         assert!(
-            last_change_id.is_none() || last_change_id.unwrap() < change_id,
+            last_change_id.is_none_or(|previous_change_id| previous_change_id < change_id),
             "change id must be strictly increasing: last_change_id={last_change_id:?}, change.change_id={change_id}"
         );
         rows_changed += 1;
         // we give user full control over CDC table - so let's not emit assert here for now
-        if last_change_id.is_some() && last_change_id.unwrap() + 1 != change_id {
+        if let Some(previous_change_id) =
+            last_change_id.filter(|&previous_change_id| previous_change_id + 1 != change_id)
+        {
             tracing::debug!(
                 "out of order change sequence: {} -> {}",
-                last_change_id.unwrap(),
+                previous_change_id,
                 change_id
             );
         }

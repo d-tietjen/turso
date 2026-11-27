@@ -9700,16 +9700,15 @@ fn test_cursor_with_btree_and_mvcc_fuzz() {
 }
 
 pub fn rng_from_time_or_env() -> (ChaCha8Rng, u64) {
-    let seed = std::env::var("SEED").map_or(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis(),
-        |v| {
-            v.parse()
-                .expect("Failed to parse SEED environment variable as u64")
-        },
-    );
+    let env_seed = std::env::var("SEED");
+    let clock_seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let seed = env_seed.map_or(clock_seed, |v| {
+        v.parse()
+            .expect("Failed to parse SEED environment variable as u64")
+    });
     let rng = ChaCha8Rng::seed_from_u64(seed as u64);
     (rng, seed as u64)
 }

@@ -721,8 +721,7 @@ fn test_cdc_bin_record(db: TempDatabase) {
     let record = record([
         Value::Null,
         Value::Integer(1),
-        // use golden ratio instead of pi because clippy has weird rule that I can't use PI approximation written by hand
-        Value::Real(1.61803),
+        Value::Real(161_803.0 / 100_000.0),
         Value::Text("hello".to_string()),
     ]);
     let mut record_hex = String::new();
