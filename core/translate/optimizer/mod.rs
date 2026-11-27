@@ -2096,10 +2096,9 @@ fn base_row_estimate(
                 // We fold left-to-right: seed with A, then apply op_i with plan_{i+1}.
                 let fallback = *RowCountEstimate::hardcoded_fallback(params);
                 let est = |p: &SelectPlan| p.estimated_output_rows.unwrap_or(fallback);
-                let mut combined = left.first().map_or(
-                    right_most.estimated_output_rows.unwrap_or(fallback),
-                    |(p, _)| est(p),
-                );
+                let mut combined = left
+                    .first()
+                    .map_or_else(|| est(right_most), |(p, _)| est(p));
                 // The estimates to the right of each operator: left[1..].est, then right_most.est
                 let rhs_estimates = left
                     .iter()

@@ -104,15 +104,11 @@ mod cmath {
         pub fn atan2(x: f64, y: f64) -> f64;
     }
 
-    // SQLite's M_PI constant (same value as SQLite's func.c)
-    #[allow(clippy::excessive_precision)]
-    const M_PI: f64 = 3.141592653589793238462643383279502884;
-
     pub fn degrees(x: f64) -> f64 {
-        x * 180.0 / M_PI
+        x * 180.0 / std::f64::consts::PI
     }
     pub fn radians(x: f64) -> f64 {
-        x * M_PI / 180.0
+        x * std::f64::consts::PI / 180.0
     }
 }
 

@@ -2763,7 +2763,7 @@ pub fn insn_to_row_with_comment(
         p3,
         p4,
         p5,
-        manual_comment.map_or(comment.to_string(), |mc| format!("{comment}; {mc}")),
+        manual_comment.map_or_else(|| comment.to_string(), |mc| format!("{comment}; {mc}")),
     )
 }
 
@@ -2784,6 +2784,6 @@ pub fn insn_to_str(
         p3,
         p4.to_string(),
         p5,
-        manual_comment.map_or(comment.to_string(), |mc| format!("{comment}; {mc}"))
+        manual_comment.map_or_else(|| comment.to_string(), |mc| format!("{comment}; {mc}"))
     )
 }
