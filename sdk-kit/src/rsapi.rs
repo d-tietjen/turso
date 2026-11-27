@@ -904,6 +904,12 @@ impl TursoDatabase {
     pub fn new_encrypted_overlap_reader(
         mut config: TursoDatabaseConfig,
     ) -> Result<Arc<Self>, TursoError> {
+        Self::validate_encrypted_handoff_config(&config)?;
+        config.open_flags = OpenFlags::ReadOnly | OpenFlags::NoLock;
+        Ok(Self::new_with_role(config, true))
+    }
+
+    fn validate_encrypted_handoff_config(config: &TursoDatabaseConfig) -> Result<(), TursoError> {
         if !cfg!(all(
             target_os = "linux",
             target_pointer_width = "64",
@@ -923,8 +929,36 @@ impl TursoDatabase {
                     .to_string(),
             ));
         }
-        config.open_flags = OpenFlags::ReadOnly | OpenFlags::NoLock;
-        Ok(Self::new_with_role(config, true))
+        Ok(())
+    }
+
+    /// Reopen the encrypted database and return its last resolved transfer ID
+    /// under the exact active writer claim.
+    #[cfg(all(
+        feature = "encrypted-wal-handoff",
+        target_os = "linux",
+        target_pointer_width = "64",
+        not(miri)
+    ))]
+    pub fn resume_encrypted_wal_writer(
+        config: TursoDatabaseConfig,
+        claim: turso_core::WriterClaim,
+    ) -> Result<(Arc<Self>, Option<turso_core::TransferId>), TursoError> {
+        Self::validate_encrypted_handoff_config(&config)?;
+        let io = Self::open_vfs_io(&config)?;
+        let (db, last_resolved_transfer) = Database::resume_encrypted_wal_writer(
+            io,
+            &config.path,
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .flags(config.open_flags)
+                .db_opts(config.database_opts())
+                .encryption(config.encryption.clone()),
+            claim,
+        )?;
+        Ok((
+            Self::from_admitted_writer(config, db),
+            last_resolved_transfer,
+        ))
     }
 
     /// Activate a writable successor using a connection from this overlap reader.
@@ -949,7 +983,7 @@ impl TursoDatabase {
         }
         let reader_guard = reader.concurrent_guard.clone();
         let _operation = reader_guard.try_use()?;
-        let mut config = self.config.clone();
+        let config = self.config.clone();
         let encryption = config.encryption.clone().ok_or_else(|| {
             TursoError::Misuse("handoff activation requires reader credentials".into())
         })?;
@@ -959,9 +993,19 @@ impl TursoDatabase {
             previous,
             transfer,
         )?;
+        Ok(Self::from_admitted_writer(config, db))
+    }
+
+    #[cfg(all(
+        feature = "encrypted-wal-handoff",
+        target_os = "linux",
+        target_pointer_width = "64",
+        not(miri)
+    ))]
+    fn from_admitted_writer(mut config: TursoDatabaseConfig, db: Arc<Database>) -> Arc<Self> {
         config.open_flags = OpenFlags::NoLock;
         let io = db.io.clone();
-        Ok(Arc::new(Self {
+        Arc::new(Self {
             config,
             encrypted_overlap_reader: false,
             db: Arc::new(Mutex::new(Some(db))),
@@ -970,7 +1014,7 @@ impl TursoDatabase {
                 ..TursoDatabaseOpenState::new()
             }),
             io: Mutex::new(Some(io)),
-        }))
+        })
     }
 
     /// Set the role before any database file is opened.
@@ -985,11 +1029,11 @@ impl TursoDatabase {
     }
 
     /// Get the config IO or open a new vfs IO from the config
-    fn open_vfs_io(&self) -> Result<Arc<dyn turso_core::IO>, TursoError> {
-        let io: Arc<dyn turso_core::IO + 'static> = if let Some(io) = &self.config.io {
+    fn open_vfs_io(config: &TursoDatabaseConfig) -> Result<Arc<dyn turso_core::IO>, TursoError> {
+        let io: Arc<dyn turso_core::IO + 'static> = if let Some(io) = &config.io {
             io.clone()
         } else {
-            match self.config.vfs {
+            match config.vfs {
                 IoBackend::Memory => Arc::new(turso_core::MemoryIO::new()),
                 IoBackend::Syscall => {
                     #[cfg(all(target_family = "unix", not(miri)))]
@@ -1032,7 +1076,7 @@ impl TursoDatabase {
                 IoBackend::Other(ref vfs) => {
                     Database::io_for_vfs(vfs).map_err(|e| TursoError::Error(format!("{e}")))?
                 }
-                IoBackend::Default => match self.config.path.as_str() {
+                IoBackend::Default => match config.path.as_str() {
                     ":memory:" => Arc::new(turso_core::MemoryIO::new()),
                     _ => Arc::new(turso_core::PlatformIO::new()?),
                 },
@@ -1061,7 +1105,7 @@ impl TursoDatabase {
                     )?;
                     // keep lock for the whole method since open_async must be called only once and never will be called concurrently
 
-                    let io: Arc<dyn turso_core::IO> = self.open_vfs_io()?;
+                    let io: Arc<dyn turso_core::IO> = Self::open_vfs_io(&self.config)?;
 
                     // Store the IO so that it can be retrieved with `io()` call even if the database is still opening
                     *self.io.lock().unwrap() = Some(io.clone());

@@ -399,19 +399,20 @@ impl WriterLease {
         self.publish(record)
     }
 
-    /// Confirm an active claim after recovering and validating its actual WAL.
-    /// Re-sync the directory before relying on a receipt left by a crash.
-    #[cfg(test)]
+    /// Confirm the active claim against the verified WAL and return the latest
+    /// accepted or rolled-back transfer ID. Re-sync the directory before
+    /// returning data from a receipt left by a crash.
     pub(crate) fn verify_active(
         &self,
         claim: WriterClaim,
         boundary: EncryptedWalWriteBoundary,
-    ) -> Result<()> {
+    ) -> Result<Option<TransferId>> {
         let record = self.verified_receipt(boundary)?;
         if record.claim != claim || record.prepared.is_some() {
             return Err(stale_writer());
         }
-        self.sync_directory()
+        self.sync_directory()?;
+        Ok(record.resolved.map(|resolved| resolved.request.id))
     }
 
     /// Match the still-prepared transfer and the successor's verified WAL boundary.
@@ -427,6 +428,33 @@ impl WriterLease {
             return Err(stale_writer());
         }
         Ok(())
+    }
+
+    /// Open the backing recorded for the exact active claim without creating files.
+    pub(crate) fn open_current_backing(&self, claim: WriterClaim) -> Result<WritableWalBacking> {
+        let receipt = self.load()?.ok_or_else(stale_writer)?;
+        if receipt.claim != claim || receipt.prepared.is_some() {
+            return Err(stale_writer());
+        }
+        let [database, wal, coordinator] = receipt.backing.0;
+        let metadata = self
+            .coordinator
+            .metadata()
+            .map_err(|err| io_error(err, "stat WAL lease"))?;
+        if (metadata.dev(), metadata.ino()) != (coordinator.dev, coordinator.ino) {
+            return Err(invalid_backing());
+        }
+        Ok(WritableWalBacking {
+            database: self.open_matching_backing(&self.backing_names[0], database)?,
+            wal: self.open_matching_backing(&self.backing_names[1], wal)?,
+        })
+    }
+
+    /// Duplicate the original coordinator for its cold lifetime mapping.
+    pub(crate) fn coordinator_file(&self) -> Result<File> {
+        self.coordinator
+            .try_clone()
+            .map_err(|err| io_error(err, "duplicate WAL coordinator"))
     }
 
     /// Reopen the original backing writable once a prepared or exactly accepted
@@ -968,7 +996,10 @@ mod tests {
                 .expect("same accepted result"),
             b
         );
-        assert!(retry.verify_active(b, boundary).is_ok());
+        assert_eq!(
+            retry.verify_active(b, boundary).expect("active successor"),
+            Some(transfer.id)
+        );
         assert!(retry
             .accept(
                 WriterClaim {
@@ -1070,7 +1101,10 @@ mod tests {
         let request = transfer(3, owner(2));
         let staging = directory.path().join(&lease.staging_name);
         std::fs::write(&staging, b"incomplete record").expect("stage interrupted write");
-        assert!(lease.verify_active(a, boundary).is_ok());
+        assert_eq!(
+            lease.verify_active(a, boundary).expect("enrolled writer"),
+            None
+        );
         assert!(lease.accept(a, request, boundary).is_err());
         lease
             .prepare(a, request, boundary, || {})
@@ -1080,7 +1114,12 @@ mod tests {
             .rollback(a, request, boundary)
             .expect("roll back before acceptance");
         assert!(lease.rollback(a, request, boundary).is_ok());
-        assert!(lease.verify_active(a, boundary).is_ok());
+        assert_eq!(
+            lease
+                .verify_active(a, boundary)
+                .expect("writer after rollback"),
+            Some(request.id)
+        );
         assert!(lease.accept(a, request, boundary).is_err());
         assert!(lease.prepare(a, request, boundary, || {}).is_err());
         let next = transfer(4, owner(2));
