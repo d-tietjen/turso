@@ -401,7 +401,6 @@ impl WriterLease {
 
     /// Confirm an active claim after recovering and validating its actual WAL.
     /// Re-sync the directory before relying on a receipt left by a crash.
-    #[cfg(test)]
     pub(crate) fn verify_active(
         &self,
         claim: WriterClaim,
@@ -427,6 +426,33 @@ impl WriterLease {
             return Err(stale_writer());
         }
         Ok(())
+    }
+
+    /// Open the backing recorded for the exact active claim without creating files.
+    pub(crate) fn open_current_backing(&self, claim: WriterClaim) -> Result<WritableWalBacking> {
+        let receipt = self.load()?.ok_or_else(stale_writer)?;
+        if receipt.claim != claim || receipt.prepared.is_some() {
+            return Err(stale_writer());
+        }
+        let [database, wal, coordinator] = receipt.backing.0;
+        let metadata = self
+            .coordinator
+            .metadata()
+            .map_err(|err| io_error(err, "stat WAL lease"))?;
+        if (metadata.dev(), metadata.ino()) != (coordinator.dev, coordinator.ino) {
+            return Err(invalid_backing());
+        }
+        Ok(WritableWalBacking {
+            database: self.open_matching_backing(&self.backing_names[0], database)?,
+            wal: self.open_matching_backing(&self.backing_names[1], wal)?,
+        })
+    }
+
+    /// Duplicate the original coordinator for its cold lifetime mapping.
+    pub(crate) fn coordinator_file(&self) -> Result<File> {
+        self.coordinator
+            .try_clone()
+            .map_err(|err| io_error(err, "duplicate WAL coordinator"))
     }
 
     /// Reopen the original backing writable once a prepared or exactly accepted

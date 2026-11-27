@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### 0.8.7
+
+* Embedded Rust databases can resume the current encrypted WAL writer after all participants exit. The explicit recovery call requires the original backing files, the correct encryption key, and the exact active writer claim at a verified committed boundary. (EDEN-4023)
+
 ### 0.8.6
 
 * Embedded Rust databases can opt in to transferring encrypted WAL write ownership on 64-bit Linux. The authenticated successor opens the original files and the existing reader keeps its snapshot. New reads report a busy database while publication is incomplete. The durable receipt supports cancellation before acceptance and exact activation retries. (EDEN-3907)

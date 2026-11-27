@@ -342,11 +342,9 @@ impl Builder {
         self.build_database(true).await
     }
 
-    /// Drive the asynchronous open for the requested database role.
-    #[allow(unused_variables, clippy::arc_with_non_send_sync)]
-    async fn build_database(self, encrypted_overlap: bool) -> Result<Database> {
+    fn into_config(self) -> turso_sdk_kit::rsapi::TursoDatabaseConfig {
         let features = self.build_features_string();
-        let config = turso_sdk_kit::rsapi::TursoDatabaseConfig {
+        turso_sdk_kit::rsapi::TursoDatabaseConfig {
             path: self.path,
             experimental_features: features,
             async_io: true,
@@ -360,7 +358,13 @@ impl Builder {
             } else {
                 turso_core::OpenFlags::default()
             },
-        };
+        }
+    }
+
+    /// Drive the asynchronous open for the requested database role.
+    #[allow(unused_variables, clippy::arc_with_non_send_sync)]
+    async fn build_database(self, encrypted_overlap: bool) -> Result<Database> {
+        let config = self.into_config();
         let db = if encrypted_overlap {
             turso_sdk_kit::rsapi::TursoDatabase::new_encrypted_overlap_reader(config)?
         } else {
@@ -425,7 +429,7 @@ impl Database {
     not(miri)
 ))]
 pub mod encrypted_wal_handoff {
-    use super::{Connection, Database, EncryptedWalWriteBoundary, Result, TursoError};
+    use super::{Builder, Connection, Database, EncryptedWalWriteBoundary, Result, TursoError};
     pub use turso_core::{TransferId, WriterClaim, WriterId, WriterTransfer};
 
     /// Enroll a quiescent native writer before allowing any successor to attach.
@@ -436,6 +440,19 @@ pub mod encrypted_wal_handoff {
             .db_core()?
             .enroll_encrypted_wal_writer(owner)
             .map_err(TursoError::from)?)
+    }
+
+    /// Resume the exact current owner and epoch on the original AES-256-GCM files.
+    ///
+    /// Supply the original key and an absolute path to the existing database. This
+    /// synchronous open requires every prior participant to have exited. It refuses
+    /// stale claims, pending transfers, and an unproven committed WAL boundary.
+    pub fn resume(builder: Builder, claim: WriterClaim) -> Result<Database> {
+        let inner = turso_sdk_kit::rsapi::TursoDatabase::resume_encrypted_wal_writer(
+            builder.into_config(),
+            claim,
+        )?;
+        Ok(Database { inner })
     }
 
     /// Publish the exact boundary and fence the predecessor. A live writer or

@@ -5924,8 +5924,11 @@ fn classify_authority_snapshot_against_wal(
     }
 
     let frame_size = WAL_FRAME_HEADER_SIZE as u64 + wal_header.page_size as u64;
-    let expected_wal_len = WAL_HEADER_SIZE as u64 + snapshot.max_frame * frame_size;
-    if wal_size != expected_wal_len {
+    let expected_wal_len = snapshot
+        .max_frame
+        .checked_mul(frame_size)
+        .and_then(|len| len.checked_add(WAL_HEADER_SIZE as u64));
+    if expected_wal_len != Some(wal_size) {
         return Ok(AuthoritySnapshotValidation::RebuildFromDisk(
             AuthoritySnapshotRebuildReason::WalLengthMismatch,
         ));
@@ -5995,6 +5998,76 @@ impl WalFileShared {
             return Err(LimboError::Busy);
         }
         file.opened_file_id()
+    }
+
+    /// Verify the physical encrypted WAL and committed index without changing the backing.
+    #[cfg(encrypted_wal_handoff)]
+    pub(crate) fn verify_cold_handoff_boundary(
+        io: &Arc<dyn IO>,
+        database: &Arc<dyn File>,
+        wal: &Arc<dyn File>,
+        authority: &MappedSharedWalCoordination,
+        snapshot: SharedWalCoordinationHeader,
+        key: &crate::EncryptionKey,
+    ) -> Result<crate::io::FileId> {
+        let identity = Self::verify_handoff_boundary(io, wal, snapshot)?;
+        if snapshot.nbackfills > snapshot.max_frame {
+            return Err(LimboError::Busy);
+        }
+
+        let header = read_exact_bytes_from_file(io, database, 0, DatabaseHeader::SIZE)?
+            .ok_or(LimboError::NotADB)?;
+        let page_size =
+            PageSize::new_from_header_u16(u16::from_be_bytes([header[16], header[17]]))?;
+        if snapshot.max_frame != 0 && page_size.get() != snapshot.page_size {
+            return Err(LimboError::NotADB);
+        }
+        let page_size = page_size.get() as usize;
+        let cipher = crate::storage::encryption::EncryptionContext::new(
+            crate::CipherMode::Aes256Gcm,
+            key,
+            page_size,
+        )?;
+        let encoded =
+            read_exact_bytes_from_file(io, database, 0, page_size)?.ok_or(LimboError::NotADB)?;
+        let decoded = cipher.decrypt_page(&encoded, DatabaseHeader::PAGE_ID)?;
+        let (pages, header_crc) = database_identity_from_header_bytes(&decoded)?;
+        if snapshot.nbackfills != 0
+            && !authority.validate_backfill_proof(snapshot, pages, header_crc)
+            && !authority.validate_backfill_proof(
+                snapshot,
+                pages,
+                crc32c::crc32c(&encoded[..DatabaseHeader::SIZE]),
+            )
+        {
+            return Err(LimboError::Busy);
+        }
+
+        if snapshot.max_frame != 0 {
+            let scanned = sqlite3_ondisk::build_shared_wal(wal, io)?;
+            if scanned.read().last_checksum_and_max_frame()
+                != (
+                    (snapshot.checksum_1, snapshot.checksum_2),
+                    snapshot.max_frame,
+                )
+            {
+                return Err(LimboError::Busy);
+            }
+            let latest =
+                InProcessWalCoordination::new(scanned).iter_latest_frames(0, snapshot.max_frame);
+            authority.verify_cold_frame_index(snapshot.max_frame, &latest)?;
+            let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
+            for index in 0..snapshot.max_frame {
+                let offset = WAL_HEADER_SIZE as u64 + index * frame_size as u64;
+                let frame = read_exact_bytes_from_file(io, wal, offset, frame_size)?
+                    .ok_or(LimboError::Busy)?;
+                let (header, encrypted_page) = sqlite3_ondisk::parse_wal_frame_header(&frame);
+                cipher.decrypt_page(encrypted_page, header.page_number as usize)?;
+            }
+        } else {
+            authority.verify_cold_frame_index(0, &[])?;
+        }
+        Ok(identity)
     }
 
     /// Authenticate the reader's retained page one and any positive backfill

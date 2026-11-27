@@ -99,6 +99,11 @@ async fn encrypted_overlap_reader_process() {
     let dir = std::env::var_os("TURSO_ENCRYPTED_OVERLAP_FIXTURE").expect("fixture directory");
     let dir = Path::new(&dir);
     let mode = std::env::var("TURSO_ENCRYPTED_OVERLAP_TEST_MODE").expect("test mode");
+    #[cfg(all(feature = "encrypted-wal-handoff", not(miri)))]
+    if mode.starts_with("cold-") {
+        cold_writer_process(dir, &mode).await;
+        return;
+    }
     if mode == "rolled-back-spill" {
         let result = encrypted_builder(&dir.join("overlap.db"), false)
             .build_encrypted_overlap_reader()
@@ -1256,6 +1261,233 @@ async fn managed_encrypted_writer_recovers_prepared_predecessor_loss() {
 #[tokio::test]
 async fn managed_encrypted_writer_refuses_unprepared_predecessor_loss() {
     verify_predecessor_loss(false).await;
+}
+
+#[cfg(all(feature = "encrypted-wal-handoff", not(miri)))]
+fn successor_claim() -> turso::encrypted_wal_handoff::WriterClaim {
+    let (previous, request) = activation_request();
+    turso::encrypted_wal_handoff::WriterClaim {
+        owner: request.successor,
+        epoch: previous.epoch.checked_add(1).expect("successor epoch"),
+    }
+}
+
+#[cfg(all(feature = "encrypted-wal-handoff", not(miri)))]
+async fn cold_writer_process(dir: &Path, mode: &str) {
+    use std::num::NonZeroU128;
+    use turso::encrypted_wal_handoff as handoff;
+
+    let backing = dir.join("overlap.db");
+    let (previous, request) = activation_request();
+    if matches!(mode, "cold-resume-a" | "cold-resume-b") {
+        let (claim, committed) = if mode == "cold-resume-a" {
+            (previous, 35)
+        } else {
+            (successor_claim(), 36)
+        };
+        let writer = handoff::resume(encrypted_builder(&backing, false), claim)
+            .expect("resume original files without a live peer");
+        let conn = writer.connect().expect("resumed writer connection");
+        assert_eq!(integer(&conn, "SELECT value FROM parent").await, committed);
+        conn.execute("PRAGMA synchronous=FULL", ())
+            .await
+            .expect("make next commit durable");
+        conn.execute("UPDATE parent SET value=value+1", ())
+            .await
+            .expect("commit as the resumed generation");
+        assert_eq!(
+            integer(&conn, "SELECT value FROM parent").await,
+            committed + 1
+        );
+        return;
+    }
+
+    if mode == "cold-successor" {
+        let database = encrypted_builder(&backing, false)
+            .build_encrypted_overlap_reader()
+            .await
+            .expect("attach B while A lives");
+        let reader = database.connect().expect("overlap connection");
+        fs::write(dir.join("cold-reader-ready"), []).expect("announce live B");
+        wait_for(&dir.join("cold-prepared"));
+        let writer = handoff::activate(&database, &reader, previous, request).expect("accept as B");
+        let conn = writer.connect().expect("accepted B connection");
+        let later = handoff::WriterTransfer {
+            id: handoff::TransferId(NonZeroU128::new(2).expect("later sequence")),
+            successor: previous.owner,
+        };
+        handoff::prepare(&writer, later).expect("prepare a later transfer");
+        handoff::rollback(&writer, later).expect("rollback leaves B active");
+        conn.execute("PRAGMA synchronous=FULL", ())
+            .await
+            .expect("make B's commit durable");
+        conn.execute("UPDATE parent SET value=36", ())
+            .await
+            .expect("commit after B's rollback");
+        fs::write(dir.join("cold-b-ready"), []).expect("announce committed B");
+        wait_for(&dir.join("cold-parent-finished"));
+        return;
+    }
+
+    let (writer, conn) = open_activation_predecessor(dir).await;
+    conn.execute("PRAGMA synchronous=FULL", ())
+        .await
+        .expect("make A's commit durable");
+    conn.execute("UPDATE parent SET value=35", ())
+        .await
+        .expect("commit on enrolled A");
+    if mode == "cold-pending" {
+        handoff::prepare(&writer, request).expect("retain a pending transfer");
+    }
+    fs::write(dir.join("cold-a-ready"), []).expect("announce A boundary");
+    if mode == "cold-handoff" {
+        wait_for(&dir.join("cold-reader-ready"));
+        handoff::prepare(&writer, request).expect("prepare B");
+        fs::write(dir.join("cold-prepared"), []).expect("announce prepared B");
+    }
+    wait_for(&dir.join("cold-parent-finished"));
+}
+
+#[cfg(all(feature = "encrypted-wal-handoff", not(miri)))]
+fn cold_participant(dir: &Path, mode: &str) -> CrashPredecessor {
+    CrashPredecessor(
+        reader_process(dir, mode)
+            .spawn()
+            .expect("start cold-recovery participant"),
+    )
+}
+
+#[cfg(all(feature = "encrypted-wal-handoff", not(miri)))]
+fn cold_file_ids(dir: &Path) -> [(u64, u64); 3] {
+    use std::os::unix::fs::MetadataExt;
+    ["overlap.db", "overlap.db-wal", "overlap.db-tshm"].map(|name| {
+        let metadata = fs::metadata(dir.join(name)).expect("original backing");
+        (metadata.dev(), metadata.ino())
+    })
+}
+
+#[cfg(all(feature = "encrypted-wal-handoff", not(miri)))]
+#[tokio::test]
+async fn managed_encrypted_writer_resumes_after_all_participants_exit() {
+    use turso::encrypted_wal_handoff as handoff;
+
+    for accepted in [false, true] {
+        let directory = tempfile::tempdir().expect("cold fixture");
+        let dir = directory.path();
+        let path = dir.join("overlap.db");
+        let mut a = cold_participant(
+            dir,
+            if accepted {
+                "cold-handoff"
+            } else {
+                "cold-initial"
+            },
+        );
+        wait_for(&dir.join("cold-a-ready"));
+        let original = cold_file_ids(dir);
+        let (previous, _) = activation_request();
+        assert!(matches!(
+            handoff::resume(encrypted_builder(&path, false), previous),
+            Err(Error::Busy(_))
+        ));
+        let claim = if accepted {
+            let mut b = cold_participant(dir, "cold-successor");
+            wait_for(&dir.join("cold-b-ready"));
+            assert!(matches!(
+                handoff::resume(encrypted_builder(&path, false), successor_claim()),
+                Err(Error::Busy(_))
+            ));
+            a.kill_and_reap();
+            b.kill_and_reap();
+            assert!(handoff::resume(encrypted_builder(&path, false), previous).is_err());
+            successor_claim()
+        } else {
+            a.kill_and_reap();
+            assert!(handoff::resume(encrypted_builder(&path, false), successor_claim()).is_err());
+            previous
+        };
+        assert!(encrypted_builder(&path, false)
+            .experimental_encryption(true)
+            .experimental_multiprocess_wal(true)
+            .build()
+            .await
+            .is_err());
+        assert!(encrypted_builder(&path, false)
+            .build_encrypted_overlap_reader()
+            .await
+            .is_err());
+        assert!(handoff::resume(encrypted_builder(&path, true), claim).is_err());
+
+        let mut resumed = cold_participant(
+            dir,
+            if accepted {
+                "cold-resume-b"
+            } else {
+                "cold-resume-a"
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(status) = resumed.0.try_wait().expect("reap resumed writer") {
+                assert!(status.success());
+                break;
+            }
+            assert!(Instant::now() < deadline, "resumed writer timed out");
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        let writer = handoff::resume(encrypted_builder(&path, false), claim)
+            .expect("reopen resumed writer's durable change");
+        let conn = writer.connect().expect("connection");
+        assert_eq!(
+            integer(&conn, "SELECT value FROM parent").await,
+            if accepted { 37 } else { 36 }
+        );
+        assert_eq!(cold_file_ids(dir), original);
+    }
+}
+
+#[cfg(all(feature = "encrypted-wal-handoff", not(miri)))]
+#[test]
+fn managed_encrypted_writer_refuses_pending_or_unproven_cold_boundary_without_repair() {
+    use std::io::Write;
+    use turso::encrypted_wal_handoff as handoff;
+
+    for (mode, wrong_key, ambiguous_tail) in [
+        ("cold-pending", false, false),
+        ("cold-initial", false, true),
+        ("cold-initial", true, false),
+    ] {
+        let directory = tempfile::tempdir().expect("cold fixture");
+        let dir = directory.path();
+        let mut a = cold_participant(dir, mode);
+        wait_for(&dir.join("cold-a-ready"));
+        a.kill_and_reap();
+        let original = cold_file_ids(dir);
+        if ambiguous_tail {
+            let mut wal = fs::OpenOptions::new()
+                .append(true)
+                .open(dir.join("overlap.db-wal"))
+                .expect("open the synthetic fixture's WAL after all participants exit");
+            wal.write_all(&[0]).expect("append an unproven WAL tail");
+            wal.sync_all().expect("make the unproven tail durable");
+        }
+        let files = [
+            "overlap.db",
+            "overlap.db-wal",
+            "overlap.db-tshm",
+            "overlap.db-tshm.owner",
+        ];
+        let contents = || files.map(|name| fs::read(dir.join(name)).expect("original bytes"));
+        let before = contents();
+        let (previous, _) = activation_request();
+        assert!(handoff::resume(
+            encrypted_builder(&dir.join("overlap.db"), wrong_key),
+            previous
+        )
+        .is_err());
+        assert_eq!(contents(), before);
+        assert_eq!(cold_file_ids(dir), original);
+    }
 }
 
 /// Refuse a different VFS or an initialized database without shared WAL coordination.

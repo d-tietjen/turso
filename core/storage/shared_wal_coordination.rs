@@ -781,6 +781,13 @@ impl Drop for SharedWalHandoffLocks<'_> {
     }
 }
 
+enum ExistingWalPeer {
+    Any,
+    Live,
+    #[cfg(encrypted_wal_handoff)]
+    Cold,
+}
+
 impl MappedSharedWalCoordination {
     const fn default_ownership_mode() -> SharedWalOwnershipMode {
         if cfg!(target_os = "linux") {
@@ -923,7 +930,7 @@ impl MappedSharedWalCoordination {
             path,
             reader_slot_count,
             Self::default_ownership_mode(),
-            false,
+            ExistingWalPeer::Any,
         )
     }
 
@@ -939,13 +946,46 @@ impl MappedSharedWalCoordination {
             path,
             reader_slot_count,
             SharedWalOwnershipMode::LinuxOfd,
-            true,
+            ExistingWalPeer::Live,
         )?
         .ok_or_else(|| {
             LimboError::InvalidArgument(
                 "encrypted overlap requires an existing shared WAL coordinator".into(),
             )
         })
+    }
+
+    /// Map the original coordinator and exclusively hold its lifetime byte until admission.
+    #[cfg(encrypted_wal_handoff)]
+    pub(crate) fn open_existing_cold(
+        path: &Path,
+        file: Arc<dyn File>,
+        reader_slot_count: u32,
+    ) -> Result<Self> {
+        let mapping = Self::map_existing(
+            path,
+            file,
+            reader_slot_count,
+            SharedWalOwnershipMode::LinuxOfd,
+            ExistingWalPeer::Cold,
+        )?;
+        mapping
+            .managed_mode
+            .store(ManagedWalMode::Fenced as u8, Ordering::Release);
+        Ok(mapping)
+    }
+
+    /// Admit read-only peers after a cold writer has validated its backing.
+    #[cfg(encrypted_wal_handoff)]
+    pub(crate) fn allow_overlap(&self) -> Result<()> {
+        if !self.file.shared_wal_try_lock_byte(
+            PROCESS_LIFETIME_LOCK_OFFSET,
+            false,
+            self.lock_kind(),
+        )? {
+            return Err(LimboError::Busy);
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1048,14 +1088,8 @@ impl MappedSharedWalCoordination {
         path: &Path,
         reader_slot_count: u32,
         ownership_mode: SharedWalOwnershipMode,
-        require_live_peer: bool,
+        peer: ExistingWalPeer,
     ) -> Result<Option<Self>> {
-        turso_assert!(
-            reader_slot_count >= 64 && reader_slot_count.is_multiple_of(64),
-            "reader_slot_count must be a non-zero multiple of 64"
-        );
-
-        let base_len = Self::base_mapped_len(reader_slot_count);
         let file = match io.open_file(
             path.to_str().ok_or_else(|| {
                 LimboError::InternalError("shared WAL coordination path is not valid UTF-8".into())
@@ -1070,21 +1104,42 @@ impl MappedSharedWalCoordination {
             ))) => return Ok(None),
             Err(err) => return Err(err),
         };
+        Self::map_existing(path, file, reader_slot_count, ownership_mode, peer).map(Some)
+    }
+
+    fn map_existing(
+        path: &Path,
+        file: Arc<dyn File>,
+        reader_slot_count: u32,
+        ownership_mode: SharedWalOwnershipMode,
+        peer: ExistingWalPeer,
+    ) -> Result<Self> {
+        turso_assert!(
+            reader_slot_count >= 64 && reader_slot_count.is_multiple_of(64),
+            "reader_slot_count must be a non-zero multiple of 64"
+        );
+        let base_len = Self::base_mapped_len(reader_slot_count);
         let lock_kind = Self::lock_kind_for_mode(ownership_mode);
-        let open_mode = if require_live_peer {
-            // A failed Linux OFD upgrade preserves our shared lock and proves
-            // that a different open file description holds a conflicting lock.
-            if !file.shared_wal_try_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, lock_kind)? {
-                return Err(LimboError::Busy);
+        let open_mode = match peer {
+            ExistingWalPeer::Any => Self::detect_open_mode(&file, lock_kind, base_len)?,
+            ExistingWalPeer::Live => {
+                if !file.shared_wal_try_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, lock_kind)? {
+                    return Err(LimboError::Busy);
+                }
+                if file.shared_wal_try_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, true, lock_kind)? {
+                    return Err(LimboError::InvalidArgument(
+                        "encrypted overlap requires a live shared WAL peer".into(),
+                    ));
+                }
+                SharedWalCoordinationOpenMode::MultiProcess
             }
-            if file.shared_wal_try_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, true, lock_kind)? {
-                return Err(LimboError::InvalidArgument(
-                    "encrypted overlap requires a live shared WAL peer".into(),
-                ));
+            #[cfg(encrypted_wal_handoff)]
+            ExistingWalPeer::Cold => {
+                if !file.shared_wal_try_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, true, lock_kind)? {
+                    return Err(LimboError::Busy);
+                }
+                SharedWalCoordinationOpenMode::Exclusive
             }
-            SharedWalCoordinationOpenMode::MultiProcess
-        } else {
-            Self::detect_open_mode(&file, lock_kind, base_len)?
         };
         let metadata_len = file.size()? as usize;
         if metadata_len < base_len {
@@ -1123,7 +1178,7 @@ impl MappedSharedWalCoordination {
         region.frame_index_publish_lock = frame_index_publish_lock;
         region.process_local_ownership = process_local_ownership;
         region.registry_path = Some(registry_path);
-        Ok(Some(region))
+        Ok(region)
     }
 
     fn process_lock_offset_for_reader(slot_index: u32) -> u64 {
@@ -2655,6 +2710,34 @@ impl MappedSharedWalCoordination {
         entries
     }
 
+    /// Match a disk scan against both enumeration and point reads without
+    /// publishing repairs. Reject a pending index tail beyond the committed
+    /// frame limit before an admitted writer can append to it.
+    #[cfg(encrypted_wal_handoff)]
+    pub(crate) fn verify_cold_frame_index(
+        &self,
+        max_frame: u64,
+        latest: &[(u64, u64)],
+    ) -> Result<()> {
+        let len = self.header().frame_index_len.load(Ordering::Acquire);
+        {
+            let mappings = self.frame_index_blocks.read();
+            if self.frame_index_overflowed()
+                || (len > 0 && Self::frame_index_entry(&mappings, len - 1).frame_id > max_frame)
+            {
+                return Err(LimboError::Busy);
+            }
+        }
+        if self.iter_latest_frames(0, max_frame) != latest
+            || latest
+                .iter()
+                .any(|&(page, frame)| self.find_frame(page, 0, max_frame, None) != Some(frame))
+        {
+            return Err(LimboError::Busy);
+        }
+        Ok(())
+    }
+
     fn base_mapped_len(reader_slot_count: u32) -> usize {
         let reader_bitmap_words = (reader_slot_count / 64) as usize;
         // Layout after header: reader_bitmap | reader_frames | reader_owners
@@ -4180,6 +4263,39 @@ mod tests {
 
         assert_eq!(mapped.find_frame(7, 0, 5, None), Some(2));
         assert_eq!(mapped.iter_latest_frames(0, 5), vec![(7, 2), (9, 4)]);
+    }
+
+    #[cfg(encrypted_wal_handoff)]
+    #[test]
+    fn cold_frame_index_refuses_a_probe_hole_or_uncommitted_index_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mapped = create_mapping(&dir.path().join("coordination.tshm"));
+        let page = 7;
+        let expected = [(page, 1)];
+        mapped.record_frame(page, 1);
+        mapped.verify_cold_frame_index(1, &expected).unwrap();
+        mapped.record_frame(page, 2);
+        assert!(matches!(
+            mapped.verify_cold_frame_index(1, &expected),
+            Err(LimboError::Busy)
+        ));
+        mapped.rollback_frames(1);
+
+        let mappings = mapped.frame_index_blocks.read();
+        let hash = MappedSharedWalCoordination::frame_index_block_hash_ptr(&mappings[0]);
+        let slot = MappedSharedWalCoordination::hash_page_id(page);
+        let moved = (slot + 1) % FRAME_INDEX_BLOCK_HASH_SLOTS as usize;
+        unsafe {
+            hash.add(moved).write(hash.add(slot).read());
+            hash.add(slot).write(0);
+        }
+        drop(mappings);
+        assert_eq!(mapped.iter_latest_frames(0, 1), expected);
+        assert_eq!(mapped.find_frame(page, 0, 1, None), None);
+        assert!(matches!(
+            mapped.verify_cold_frame_index(1, &expected),
+            Err(LimboError::Busy)
+        ));
     }
 
     #[test]

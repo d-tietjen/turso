@@ -554,7 +554,7 @@ pub struct OpenDbAsyncState {
     /// Sub state machine for `MvStore::bootstrap_nonblock`, driven in
     /// `BootstrapMvStore`.
     mvcc_bootstrap_state: mvcc::database::BootstrapState,
-    /// Verified existing WAL state supplied only by explicit writer activation.
+    /// Verified existing WAL state supplied by explicit writer admission.
     #[cfg(encrypted_wal_handoff)]
     handoff_bootstrap: Option<HandoffBootstrap>,
 }
@@ -3384,6 +3384,120 @@ impl Database {
         })
     }
 
+    /// Resume the current claim on the original AES-256-GCM WAL after all participants exit.
+    /// A pending transfer, another participant, or an unproven committed boundary refuses.
+    #[cfg(encrypted_wal_handoff)]
+    pub fn resume_encrypted_wal_writer(
+        io: Arc<dyn IO>,
+        path: &str,
+        options: OpenOptions,
+        claim: WriterClaim,
+    ) -> Result<Arc<Self>> {
+        let database_path = Path::new(path);
+        if !io.supports_encrypted_wal_handoff()
+            || !database_path.is_absolute()
+            || !database_path
+                .canonicalize()
+                .is_ok_and(|original| original == database_path)
+            || !Self::path_allows_shared_wal_coordination(database_path)?
+            || options.storage.is_some()
+            || options.wal_path.is_some()
+            || options.page_codec.is_some()
+            || options.durable_storage.is_some()
+            || options.flags.contains(OpenFlags::ReadOnly)
+            || options.db_opts.encrypted_overlap_reader
+            || options.db_opts.enable_attach
+            || options.db_opts.enable_vacuum
+            || options
+                .encryption
+                .as_ref()
+                .is_none_or(|opts| opts.cipher != "aes256gcm")
+        {
+            return Err(LimboError::InvalidArgument(
+                "writer resume requires original private AES-256-GCM WAL storage".into(),
+            ));
+        }
+        let mut lease = WriterLease::acquire(database_path)?;
+        let backing = lease.open_current_backing(claim)?;
+        let wal_path = format!("{path}-wal");
+        let coordinator_path = storage::wal::coordination_path_for_wal_path(&wal_path);
+        let authority = Arc::new(MappedSharedWalCoordination::open_existing_cold(
+            Path::new(&coordinator_path),
+            io::handoff_file(lease.coordinator_file()?, &coordinator_path),
+            64,
+        )?);
+        let database = io::handoff_file(backing.database, path);
+        let wal = io::handoff_file(backing.wal, &wal_path);
+        let encryption = options.encryption.as_ref().ok_or(LimboError::NotADB)?;
+        let encryption_key = EncryptionKey::from_hex_string(&encryption.hexkey)?;
+        let boundary = lease.with_mutation_locks(authority.opened_file_id()?, |lease| {
+            let snapshot = authority.try_snapshot().ok_or(LimboError::Busy)?;
+            let boundary = EncryptedWalWriteBoundary {
+                database: database.opened_file_id()?,
+                wal: WalFileShared::verify_cold_handoff_boundary(
+                    &io,
+                    &database,
+                    &wal,
+                    &authority,
+                    snapshot,
+                    &encryption_key,
+                )?,
+                coordinator: authority.opened_file_id()?,
+                committed_frames: snapshot.max_frame,
+                wal_position: snapshot.encode(),
+            };
+            lease.verify_active(claim, boundary)?;
+            Ok(boundary)
+        })?;
+        let key = DatabaseKey::File(boundary.database);
+        let opts = options
+            .db_opts
+            .with_multiprocess_wal(true)
+            .with_encryption(true);
+        let writer = Self::bootstrap_verified_writer(
+            io,
+            path,
+            &wal_path,
+            options.db_opts(opts).flags(OpenFlags::NoLock),
+            Arc::new(DatabaseFile::new(database)),
+            HandoffBootstrap {
+                authority: authority.clone(),
+                wal: WalFileShared::from_verified_handoff(wal, &boundary)?,
+            },
+        )?;
+        lease.with_mutation_locks(authority.opened_file_id()?, |lease| {
+            let verified = writer.encrypted_boundary_under_locks(&authority, false)?;
+            if verified != boundary {
+                return Err(LimboError::Busy);
+            }
+            lease.verify_active(claim, verified)
+        })?;
+        authority.with_handoff_locks(|| {
+            let mut registry = DATABASE_MANAGER.lock();
+            if registry.get(&key).is_some_and(|entry| match entry {
+                RegistryEntry::Opening => true,
+                RegistryEntry::Ready(database) => database.upgrade().is_some(),
+                RegistryEntry::Handoff { reader, writer } => {
+                    reader.upgrade().is_some() || writer.upgrade().is_some()
+                }
+            }) {
+                return Err(LimboError::Busy);
+            }
+            authority.allow_overlap()?;
+            *writer.managed_writer.lock() = Some(ManagedWriter {
+                claim,
+                lease: Some(lease),
+                pending: None,
+                last_rollback: None,
+                activation: None,
+            });
+            authority.set_managed_mode(ManagedWalMode::Active);
+            registry.insert(key, RegistryEntry::Ready(Arc::downgrade(&writer)));
+            Ok(())
+        })?;
+        Ok(writer)
+    }
+
     /// Accept a handoff using an attached reader and return the new writer.
     /// The reader retains its original descriptors and snapshot. The writer
     /// opens the same files, rebuilds local schema state without recovery,
@@ -3532,28 +3646,54 @@ impl Database {
             &self.path,
         )));
         let wal_file = io::handoff_file(backing.wal, &self.wal_path);
-        let wal = WalFileShared::from_verified_handoff(wal_file, boundary)?;
         let mut opts = self.opts;
         opts.encrypted_overlap_reader = false;
+        Self::bootstrap_verified_writer(
+            self.io.clone(),
+            &self.path,
+            &self.wal_path,
+            OpenOptions::new(self.dialect.clone())
+                .flags(OpenFlags::NoLock)
+                .db_opts(opts)
+                .encryption(encryption)
+                .allocators(self.allocators.clone()),
+            database,
+            HandoffBootstrap {
+                authority,
+                wal: WalFileShared::from_verified_handoff(wal_file, boundary)?,
+            },
+        )
+    }
+
+    /// Load a fenced writer's schema from the already verified backing.
+    #[cfg(encrypted_wal_handoff)]
+    fn bootstrap_verified_writer(
+        io: Arc<dyn IO>,
+        path: &str,
+        wal_path: &str,
+        options: OpenOptions,
+        database: Arc<dyn DatabaseStorage>,
+        bootstrap: HandoffBootstrap,
+    ) -> Result<Arc<Self>> {
         let mut state = OpenDbAsyncState::new();
-        state.handoff_bootstrap = Some(HandoffBootstrap { authority, wal });
+        state.handoff_bootstrap = Some(bootstrap);
         loop {
             match Self::do_open_async_guarded(
                 &mut state,
-                self.io.clone(),
-                &self.path,
-                Some(&self.wal_path),
+                io.clone(),
+                path,
+                Some(wal_path),
                 database.clone(),
-                OpenFlags::NoLock,
-                opts,
-                Some(encryption.clone()),
+                options.flags,
+                options.db_opts,
+                options.encryption.clone(),
                 None,
                 None,
-                self.allocators.clone(),
-                self.dialect.clone(),
+                options.allocators.clone(),
+                options.dialect.clone(),
             )? {
                 IOResult::Done(writer) => return Ok(writer),
-                IOResult::IO(completion) => completion.wait(self.io.as_ref())?,
+                IOResult::IO(completion) => completion.wait(io.as_ref())?,
             }
         }
     }
