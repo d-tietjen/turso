@@ -426,7 +426,7 @@ async fn run_tests(
         "pg" => {
             // --binary defaults to tursodb for the cli backend; for pg the
             // server binary is tursopg, so rewrite an untouched default.
-            let binary = if binary == *"tursodb" {
+            let binary = if binary == Path::new("tursodb") {
                 PathBuf::from("tursopg")
             } else {
                 binary
