@@ -647,7 +647,7 @@ pub fn insn_to_row(
                         "r[{}]={}.{}",
                         dest,
                         get_table_or_index_name(*cursor_id),
-                        &column_name.map_or_else(|| format!("column {}", *column), |name| name.to_string())
+                        column_name.map_or_else(|| format!("column {}", *column), |name| name.to_string())
                     ),
                 )
             }
@@ -1211,7 +1211,7 @@ pub fn insn_to_row(
                 format!(
                     "if (r[{}]!={}.rowid) goto {}",
                     src_reg,
-                    &program.cursor_ref[*cursor_id]
+                    program.cursor_ref[*cursor_id]
                         .0
                         .as_ref()
                         .map(|k| format!(
@@ -2778,7 +2778,7 @@ pub fn insn_to_str(
     format!(
         "{:<4}  {:<17}  {:<4}  {:<4}  {:<4}  {:<13}  {:<2}  {}",
         addr,
-        &(indent + opcode),
+        (indent + opcode),
         p1,
         p2,
         p3,

@@ -824,7 +824,9 @@ pub fn blob_literal_hex(blob: &str) -> &str {
 pub fn blob_literal_bytes(blob: &str) -> impl Iterator<Item = u8> + '_ {
     blob_literal_hex(blob)
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let hex_byte = std::str::from_utf8(pair).expect("parser validated hex string");
             u8::from_str_radix(hex_byte, 16).expect("parser validated hex digit")

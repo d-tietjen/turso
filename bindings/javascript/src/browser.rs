@@ -106,7 +106,17 @@ impl Default for Opfs {
 #[link(wasm_import_module = "env")]
 extern "C" {
     fn lookup_file(path: *const u8, path_len: usize) -> i32;
+    #[allow(
+        unknown_lints,
+        invalid_runtime_symbol_definitions,
+        reason = "the WebAssembly host supplies this OPFS import with its own ABI"
+    )]
     fn read(handle: i32, buffer: *mut u8, buffer_len: usize, offset: i32) -> i32;
+    #[allow(
+        unknown_lints,
+        invalid_runtime_symbol_definitions,
+        reason = "the WebAssembly host supplies this OPFS import with its own ABI"
+    )]
     fn write(handle: i32, buffer: *const u8, buffer_len: usize, offset: i32) -> i32;
     fn sync(handle: i32) -> i32;
     fn truncate(handle: i32, length: usize) -> i32;
@@ -188,7 +198,7 @@ impl File for OpfsFile {
         let buffer = buffer.as_mut_slice();
         if web_worker {
             let result = unsafe { read(handle, buffer.as_mut_ptr(), buffer.len(), pos as i32) };
-            c.complete(result as i32);
+            c.complete(result);
         } else {
             let completion_no = self.opfs.register_completion(c.clone());
             unsafe {
@@ -224,7 +234,7 @@ impl File for OpfsFile {
         let buffer = buffer.as_slice();
         if web_worker {
             let result = unsafe { write(handle, buffer.as_ptr(), buffer.len(), pos as i32) };
-            c.complete(result as i32);
+            c.complete(result);
         } else {
             let completion_no = self.opfs.register_completion(c.clone());
             unsafe {
@@ -250,7 +260,7 @@ impl File for OpfsFile {
         let handle = self.handle;
         if web_worker {
             let result = unsafe { sync(handle) };
-            c.complete(result as i32);
+            c.complete(result);
         } else {
             let completion_no = self.opfs.register_completion(c.clone());
             unsafe { sync_async(handle, completion_no) };
@@ -273,7 +283,7 @@ impl File for OpfsFile {
         let handle = self.handle;
         if web_worker {
             let result = unsafe { truncate(handle, len as usize) };
-            c.complete(result as i32);
+            c.complete(result);
         } else {
             let completion_no = self.opfs.register_completion(c.clone());
             unsafe { truncate_async(handle, len as usize, completion_no) };

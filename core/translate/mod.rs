@@ -71,7 +71,6 @@ use turso_parser::ast;
 use update::translate_update;
 
 #[instrument(skip_all, level = Level::DEBUG)]
-#[allow(clippy::too_many_arguments)]
 #[turso_macros::trace_stack]
 #[allow(clippy::too_many_arguments)]
 pub fn translate(

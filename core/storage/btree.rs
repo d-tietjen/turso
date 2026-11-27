@@ -9959,7 +9959,7 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
     // loop in `process_cells` needs. Using unstable sort is fine as the
     // original order doesn't matter.
     if !is_physically_sorted {
-        cells.sort_unstable_by(|a, b| b.old_offset.cmp(&a.old_offset));
+        cells.sort_unstable_by_key(|cell| std::cmp::Reverse(cell.old_offset));
     }
 
     // Cells below the pointer array or overlapping each other mean the

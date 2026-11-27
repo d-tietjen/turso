@@ -83,13 +83,3 @@ impl QueryProfile {
             + self.setval_weight
     }
 }
-
-#[derive(Debug, Clone, strum::VariantArray)]
-pub enum QueryTypes {
-    CreateTable,
-    CreateIndex,
-    Insert,
-    Update,
-    Delete,
-    DropTable,
-}

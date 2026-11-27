@@ -2304,14 +2304,14 @@ pub fn checksum_wal(
     let mut s0: u32 = input.0;
     let mut s1: u32 = input.1;
     if native_endian {
-        for words in buf.chunks_exact(8) {
+        for words in buf.as_chunks::<8>().0 {
             let v0 = u32::from_ne_bytes([words[0], words[1], words[2], words[3]]);
             let v1 = u32::from_ne_bytes([words[4], words[5], words[6], words[7]]);
             s0 = s0.wrapping_add(v0.wrapping_add(s1));
             s1 = s1.wrapping_add(v1.wrapping_add(s0));
         }
     } else {
-        for words in buf.chunks_exact(8) {
+        for words in buf.as_chunks::<8>().0 {
             let v0 = u32::from_ne_bytes([words[0], words[1], words[2], words[3]]).swap_bytes();
             let v1 = u32::from_ne_bytes([words[4], words[5], words[6], words[7]]).swap_bytes();
             s0 = s0.wrapping_add(v0.wrapping_add(s1));
